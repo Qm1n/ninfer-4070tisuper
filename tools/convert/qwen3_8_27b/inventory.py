@@ -33,14 +33,23 @@ GDN_LAYERS = qwen3_6_inventory.GDN_LAYERS
 RESOURCE_SPECS = qwen3_6_inventory.RESOURCE_SPECS
 
 
-def _w8_vocabulary_endpoint(spec: TensorSpec) -> TensorSpec:
+def _a5000_endpoint_and_down(spec: TensorSpec) -> TensorSpec:
+    """Fork tuning for 16 GB VRAM: Q6 vocabulary endpoints and Q4 MLP down.
+
+    Q6 endpoints save 0.86 GiB versus W8 (the engine's embed gather has a Q6
+    route and the output head runs through ops::linear). value_z/output stay
+    Q5 (fused attention-input kernels). mlp/down is Q4 via the fork's
+    q4_linear_add residual kernels (saves 0.70 GiB versus Q5).
+    """
     if spec.name in ("text/token_embedding", "text/output_head"):
-        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, W8)
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q6)
+    if spec.name.endswith("mlp/down") or spec.name.endswith("/output"):
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q4)
     return spec
 
 
 TEXT_CORE_TENSOR_SPECS = tuple(
-    _w8_vocabulary_endpoint(spec)
+    _a5000_endpoint_and_down(spec)
     for spec in qwen3_6_inventory.TEXT_CORE_TENSOR_SPECS
 )
 DRAFT_HEAD_TENSOR_SPECS = qwen3_6_inventory.DRAFT_HEAD_TENSOR_SPECS

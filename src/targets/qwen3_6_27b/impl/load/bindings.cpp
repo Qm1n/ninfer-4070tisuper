@@ -37,6 +37,9 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
         return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
+        // Fork: Q6 endpoints for the A5000 build (gather has a Q6 route; head runs
+        // through ops::linear which accepts Q6). W8 endpoints cost 0.86 GiB more.
+        return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen36Nvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
@@ -231,8 +234,9 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
+            // Fork: Q4 output via q4_linear_add (oracle-tested at {5120,6144}).
             target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                  NumericFormat::Q5G64_F16S, {5120, 6144});
+                                                  NumericFormat::Q4G64_F16S, {5120, 6144});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -255,14 +259,16 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::Q5G64_F16S, {5120, 6144});
+                bind_weight(binder, prefix + "gdn/output", NumericFormat::Q4G64_F16S, {5120, 6144});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
         target.mlp.gate_up =
             bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
+        // Fork: Q4 down via the new q4_linear_add residual kernels; saves 0.70 GiB
+        // versus Q5 on 16 GB cards.
         target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408});
+            bind_weight(binder, prefix + "mlp/down", NumericFormat::Q4G64_F16S, {5120, 17408});
     }
 }
 

@@ -596,8 +596,11 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.sm() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
+    // Fork: the groupwise-int kernels (q4/q5/q6/w8/bf16 SIMT+mma paths) and int8/bf16
+    // paged KV run on any sm_80+ device; only NVFP4/FP8 profiles genuinely need sm_120.
+    if (device.sm() < 80) {
+        throw std::invalid_argument(
+            "Qwen3.6 family runtime requires compute capability >= 8.0 on this fork");
     }
 }
 

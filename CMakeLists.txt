@@ -6,13 +6,14 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+# Fork: allow non-Blackwell archs (NVFP4 kernels will fail to compile for them)
 
 project(ninfer LANGUAGES C CXX CUDA)
+
+# Fork: CUDA 12.4's gcc-13 toolchain dir leaks -L/usr/lib/gcc/x86_64-linux-gnu/13 into
+# every CUDA link, whose older libstdc++.so shadows the system one and lacks
+# __cxa_call_terminate. Link the real runtime by absolute path so it wins.
+link_libraries(/usr/lib/x86_64-linux-gnu/libstdc++.so.6)
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
@@ -33,9 +34,9 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
   set(CMAKE_JOB_POOL_LINK cuda_link)
 endif()
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.4)
   message(FATAL_ERROR
-    "NInfer requires CUDA 13.1 or newer; found CUDA compiler "
+    "NInfer fork requires CUDA 12.4+ for non-NVFP4 builds; found CUDA compiler "
     "${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
