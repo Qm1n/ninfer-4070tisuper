@@ -442,8 +442,21 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    if (weights_profile == WeightsProfile::Qwen38GroupwiseInt) {
+        // Fork: page-locked host-resident embedding. The gather reads one row
+        // (~10 KiB) per token over PCIe — invisible next to the weight stream —
+        // while freeing ~0.93 GiB of VRAM for KV capacity.
+        const std::array<std::uint64_t, 2> embedding_shape = {248320, 5120};
+        artifact::ObjectHandle embedding_object             = binder.require_tensor(
+            "text/token_embedding", vocabulary_format,
+            artifact::StorageLayout::RowSplitK128V1, embedding_shape);
+        binder.retain_pinned_on_host(embedding_object);
+        out.token_embedding =
+            WeightPlan{.object = embedding_object, .format = vocabulary_format};
+    } else {
+        out.token_embedding =
+            bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    }
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
         // Fork: Preserve the registered Qwen3.6 Q4/Q5 artifact contract.

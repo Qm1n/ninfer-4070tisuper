@@ -28,6 +28,9 @@ struct DeviceMaterialization {
 
 struct HostMaterialization {
     ObjectHandle object;
+    // Fork: pinned host tensors are cudaHostAlloc'd and device-addressable via UVA
+    // (zero-copy gather over PCIe; the embedding is read one row per token).
+    bool pinned = false;
 };
 
 struct MaterializationPlan {
@@ -49,6 +52,7 @@ public:
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
+    void retain_pinned_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();
 

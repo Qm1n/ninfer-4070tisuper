@@ -111,6 +111,20 @@ void Binder::retain_on_host(ObjectHandle handle) {
     materialization_.host_objects.push_back(HostMaterialization{handle});
     planned_[handle.index] = true;
 }
+void Binder::retain_pinned_on_host(ObjectHandle handle) {
+    // Fork: unlike retain_on_host (resource files only), pinned host retention
+    // targets tensors whose consumers read a few rows per step (embedding gather).
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("pinned host retention requires a tensor object");
+    }
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(tensor->name));
+    }
+    materialization_.host_objects.emplace_back(HostMaterialization{handle, /*pinned=*/true});
+    planned_[handle.index] = true;
+}
 
 void Binder::validate_only(ObjectHandle handle) {
     const ObjectDescriptor& object = descriptor(handle);

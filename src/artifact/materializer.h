@@ -32,7 +32,7 @@ struct MaterializationStats {
 class MaterializedArtifact {
 public:
     MaterializedArtifact()                                           = default;
-    ~MaterializedArtifact()                                          = default;
+    ~MaterializedArtifact();
     MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
     MaterializedArtifact& operator=(MaterializedArtifact&&) noexcept = default;
     MaterializedArtifact(const MaterializedArtifact&)                = delete;
@@ -58,6 +58,8 @@ private:
     std::unique_ptr<DeviceArena> device_arena_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
+    // Fork: cudaHostAlloc'd backing for pinned host tensors; freed on destruction.
+    std::vector<void*> pinned_host_allocations_;
 };
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,

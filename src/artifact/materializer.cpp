@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include <cuda_runtime.h>
+#include <cstring>
 
 #include <algorithm>
 #include <chrono>
@@ -95,6 +96,13 @@ DeviceArena& MaterializedArtifact::device_arena() {
     return *device_arena_;
 }
 
+MaterializedArtifact::~MaterializedArtifact() {
+    // Fork: release page-locked host tensors.
+    for (void* pinned : pinned_host_allocations_) {
+        if (pinned != nullptr) { cudaFreeHost(pinned); }
+    }
+}
+
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, LoadProgress* progress) {
     MaterializedArtifact out;
@@ -111,6 +119,21 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (const HostMaterialization& placement : plan.host_objects) {
         auto& resource            = out.objects_.at(placement.object.index).resource;
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        if (placement.pinned) {
+            // Fork: page-locked, UVA-mapped host memory. Stored in the object's
+            // `device` pointer slot: kernels dereference it zero-copy over PCIe.
+            void* pinned = nullptr;
+            if (cudaHostAlloc(&pinned, payload.data.size(), cudaHostAllocDefault) != cudaSuccess) {
+                throw ArtifactError("pinned host tensor allocation failed");
+            }
+            std::memcpy(pinned, payload.data.data(), payload.data.size());
+            out.objects_.at(placement.object.index).device = pinned;
+            out.pinned_host_allocations_.push_back(pinned);
+            out.stats_.retained_resource_bytes += payload.data.size();
+            out.stats_.file_bytes = checked_add(out.stats_.file_bytes, payload.data.size(),
+                                                "artifact read bytes overflow u64");
+            continue;
+        }
         resource.assign(payload.data.begin(), payload.data.end());
         out.stats_.retained_resource_bytes += resource.size();
         out.stats_.file_bytes =
