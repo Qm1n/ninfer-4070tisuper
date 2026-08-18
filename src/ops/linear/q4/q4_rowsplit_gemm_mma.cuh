@@ -90,7 +90,7 @@ __device__ __forceinline__ int q4_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule_, bool Full>
+template <class Schedule_, bool Full, bool AddResidual = false>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void q4_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -369,6 +369,16 @@ void q4_rowsplit_gemm_mma_kernel(
         cp_commit();
     }
 
+    // Fork: AddResidual variant for the fused down/output projection — each
+    // fragment element has a unique owning thread, so read-modify-write is safe.
+    constexpr auto store = [](__nv_bfloat16* __restrict__ dst, std::int64_t idx, float v) {
+        if constexpr (AddResidual) {
+            dst[idx] = __float2bfloat16_rn(__bfloat162float(dst[idx]) + v);
+        } else {
+            dst[idx] = __float2bfloat16_rn(v);
+        }
+    };
+
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
         const int output_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
@@ -379,33 +389,29 @@ void q4_rowsplit_gemm_mma_kernel(
             const int output_col1 = output_col0 + 1;
             const float* values   = accum[mi][ni];
             if constexpr (kFull) {
-                out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                    __float2bfloat16_rn(values[0]);
-                out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                    __float2bfloat16_rn(values[1]);
-                out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                    __float2bfloat16_rn(values[2]);
-                out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                    __float2bfloat16_rn(values[3]);
+                store(out, static_cast<std::int64_t>(output_col0) * rows + output_row0, values[0]);
+                store(out, static_cast<std::int64_t>(output_col1) * rows + output_row0, values[1]);
+                store(out, static_cast<std::int64_t>(output_col0) * rows + output_row1, values[2]);
+                store(out, static_cast<std::int64_t>(output_col1) * rows + output_row1, values[3]);
             } else {
                 if (output_row0 < rows) {
                     if (output_col0 < cols) {
-                        out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                            __float2bfloat16_rn(values[0]);
+                        store(out, static_cast<std::int64_t>(output_col0) * rows + output_row0,
+                              values[0]);
                     }
                     if (output_col1 < cols) {
-                        out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                            __float2bfloat16_rn(values[1]);
+                        store(out, static_cast<std::int64_t>(output_col1) * rows + output_row0,
+                              values[1]);
                     }
                 }
                 if (output_row1 < rows) {
                     if (output_col0 < cols) {
-                        out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                            __float2bfloat16_rn(values[2]);
+                        store(out, static_cast<std::int64_t>(output_col0) * rows + output_row1,
+                              values[2]);
                     }
                     if (output_col1 < cols) {
-                        out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                            __float2bfloat16_rn(values[3]);
+                        store(out, static_cast<std::int64_t>(output_col1) * rows + output_row1,
+                              values[3]);
                     }
                 }
             }

@@ -104,6 +104,23 @@ using Q4GemvR1W8DirectSchedule =
                            Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
                            Cache::ca, 80, 1>;
 
+// Fork: the R1W8 schedule above hard-codes StaticGroupsPerRow=80 (k=5120 only) —
+// reusing it at other K silently truncates the dot to the first 80 groups.
+// K-specialized twins for the wide residual families (96 and 272 groups; both
+// keep the pair/static ownership assertions satisfied: 48%8==0, 136%8==0).
+using Q4GemvR1W8K6144Schedule =
+    Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
+                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
+                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
+                           Cache::ca, 96, 1>;
+// 272 groups exceed the static path's 16-groups-per-warp tile ceiling, so the
+// wide-K residual GEMV rides the dynamic pair-split + tile-loop path instead.
+using Q4GemvR1W8K17408Schedule =
+    Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
+                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
+                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
+                           Cache::ca, 0, 1>;
+
 template <class Schedule, Q4GemvScaleAccess ScaleAccess = Schedule::kScaleAccess>
 struct Q4GemvTileStorage;
 

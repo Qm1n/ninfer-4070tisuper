@@ -12,6 +12,10 @@ void launch_q4_gemv_r4_w1_direct(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);
 void launch_q4_gemv_r1_w8_direct(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);
+
+// Fork: K-specialized R1W8 GEMV (see q4_rowsplit_gemv.cuh).
+void launch_q4_gemv_r1_w8_k6144(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_gemv_r1_w8_k17408(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& w, Tensor& out,
@@ -34,5 +38,7 @@ void launch_q4_mma_r64_c120_partial(const Tensor& x, const Weight& w, Tensor& ou
                                     cudaStream_t stream);
 void launch_q4_mma_r64_c120(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+// Fork: residual variant (AddResidual=true instantiation).
+void launch_q4_mma_r64_c128_residual(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

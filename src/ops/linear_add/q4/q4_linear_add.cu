@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 
@@ -49,18 +50,26 @@ struct Q4SimtResidualEpilogue {
 
 void launch_gemv_residual(const Tensor& x, const Weight& w, Tensor& residual_out,
                           cudaStream_t stream) {
-    using Schedule        = Q4GemvR1W8DirectSchedule;
+    // Fork: StaticGroupsPerRow must equal k/64 — the base R1W8 schedule is
+    // hard-coded for k=5120. Route by K to the correct specialization.
     const std::int32_t rows = residual_out.ne[0];
     const std::int32_t k    = x.ne[0];
-    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kRowsPerCta)), 1u, 1u);
-    constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
-    q4_rowsplit_gemv_kernel<Schedule, false, 0, Q4GemvResidualEpilogue>
-        <<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales),
-            static_cast<__nv_bfloat16*>(residual_out.data), nullptr, rows, k);
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch = [&]<class Schedule>() {
+        const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kRowsPerCta)), 1u, 1u);
+        constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
+        q4_rowsplit_gemv_kernel<Schedule, false, 0, Q4GemvResidualEpilogue>
+            <<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales),
+                static_cast<__nv_bfloat16*>(residual_out.data), nullptr, rows, k);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    switch (k) {
+    case 6144:  launch.operator()<Q4GemvR1W8K6144Schedule>();  return;
+    case 17408: launch.operator()<Q4GemvR1W8K17408Schedule>(); return;
+    default:    launch.operator()<Q4GemvR1W8DirectSchedule>(); return;  // k == 5120
+    }
 }
 
 template <class Schedule, bool Full>
@@ -119,14 +128,14 @@ void q4_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_o
         throw std::invalid_argument("q4 linear_add: unsupported exact shape");
     }
     if (x.ne[1] == 1) {
-        // ponytail: the specialized Q4 GEMV is only validated for k=5120 upstream;
-        // at k=6144/17408 it returns partial dots. Route T=1 through the SIMT
-        // kernel (test-verified at both shapes) until a wide-K GEMV lands.
-        route_simt<Q4SimtR8C4ResidualSchedule>(x, w, residual_out, stream);
+        launch_gemv_residual(x, w, residual_out, stream);
         return;
     }
     if (x.ne[1] <= 8) {
         route_simt<Q4SimtR8C4ResidualSchedule>(x, w, residual_out, stream);
+    } else if (x.ne[1] > 16) {
+        // Fork: large-T prefill through the residual MMA (2.5x SIMT throughput).
+        launch_q4_mma_r64_c128_residual(x, w, residual_out, stream);
     } else {
         route_simt<Q4SimtR8C8ResidualSchedule>(x, w, residual_out, stream);
     }

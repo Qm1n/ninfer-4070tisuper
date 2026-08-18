@@ -161,4 +161,52 @@ void launch_q4_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaS
     launch_route<Q4MmaR64C128Schedule>(x, w, out, stream);
 }
 
+namespace {
+
+// Fork: residual variant for the fused down/output projection (large-T prefill).
+// Element ownership per fragment is unique, so read-modify-write is race-free.
+template <class Schedule, bool Full>
+void launch_residual_schedule(const Tensor& x, const Weight& w, Tensor& residual_out,
+                              cudaStream_t stream) {
+    const std::int32_t rows     = residual_out.ne[0];
+    const std::int32_t k        = x.ne[0];
+    const std::int32_t cols     = x.ne[1];
+    const std::int32_t padded_k = w.padded_shape[1];
+    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kBlockRows)),
+                    static_cast<unsigned>(div_up(cols, Schedule::kBlockCols)), 1u);
+    q4_rowsplit_gemm_mma_kernel<Schedule, Full, true>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales),
+            static_cast<__nv_bfloat16*>(residual_out.data), rows, k, cols, padded_k);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Schedule>
+void launch_residual_route(const Tensor& x, const Weight& w, Tensor& residual_out,
+                           cudaStream_t stream) {
+    const bool full =
+        (residual_out.ne[0] % Schedule::kBlockRows) == 0 && (x.ne[1] % Schedule::kBlockCols) == 0;
+    for_each_token_slice(x.ne[1], Schedule::kBlockCols,
+                         [&](std::int32_t offset, std::int32_t count) {
+                             const Tensor x_slice      = x.slice(1, offset, count);
+                             Tensor residual_slice     = residual_out.slice(1, offset, count);
+                             if (full) {
+                                 launch_residual_schedule<Schedule, true>(x_slice, w, residual_slice,
+                                                                         stream);
+                             } else {
+                                 launch_residual_schedule<Schedule, false>(x_slice, w,
+                                                                          residual_slice, stream);
+                             }
+                         });
+}
+
+}  // namespace
+
+void launch_q4_mma_r64_c128_residual(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                     cudaStream_t stream) {
+    launch_residual_route<Q4MmaR64C128Schedule>(x, w, residual_out, stream);
+}
+
 } // namespace ninfer::ops::detail

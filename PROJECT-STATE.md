@@ -238,3 +238,34 @@ Consequences:
 
 Current stack of record: ~/ninfer-a5000 @ "sim-PPL verdict" commit;
 artifact /run/media/lio/data/g/qwen3_8_27b_minq4.ninfer.
+
+## 11. DECODE/PREFILL SPEED PUSH (2026-08-18 night)
+
+Root-caused the "wide-K Q4 GEMV partial dots": Q4GemvR1W8DirectSchedule hard-codes
+StaticGroupsPerRow=80 (k=5120-only). Using it at k=6144/17408 silently truncates the
+dot (groups>80 skipped). Fix: Q4GemvR1W8K6144Schedule (static 96) and
+Q4GemvR1W8K17408Schedule (dynamic 0 — 272 groups exceed the static path's
+16-groups/warp tile ceiling). q4_linear_add T=1 routes by K; q4_dispatch k=6144/17408
+cases added properly (earlier attempt had nested them as n-cases — dead code, which
+is why a "passing probe" lied). Also: unknown concurrent edits had landed post-9565d40
+and broke the build — reverted to the oracle-verified tree (commit f1e4d3d).
+
+New: q4_rowsplit_gemm_mma AddResidual template param + launch_q4_mma_r64_c128_residual
+(q4_linear_add T>16 now rides MMA; SIMT stays 2..16).
+
+MEASURED (minq4 artifact, all tests green):
+| metric | before | after |
+|---|---|---|
+| plain decode @32k | 13.9 tok/s | 13.0-13.9 (bandwidth wall — see below) |
+| MTP3 decode @20k | 25.8 tok/s | 25.2-26.0 (acceptance 63-64%) |
+| prefill (2.6k prompt) | 92 tok/s | **377 tok/s** (--prefill-chunk 384-512) |
+
+BANDWIDTH WALL: 13.9 tok/s x 15.7 GB device weights ≈ 218 GB/s ≈ A5000 effective
+bandwidth. Plain decode cannot exceed ~14 tok/s at this weight size regardless of
+kernels; MTP3 commits ~1.9 tokens per weight pass → 26 tok/s is the ceiling.
+Draft sweep: 1:18.3(83%), 2:18.9(61%), 3:25.6(64%), 4:15.7(44%), 5:14.1(35%) — 3 optimal.
+The ONLY decode levers left: fewer weight bytes (quality-gated: Q3 dead at RTN) or
+higher acceptance (architectural).
+
+Operational: prefill chunks >~600 tokens hit bf16_gdn_gating_proj cooperative-launch
+block limit (upstream kernel) — always pass --prefill-chunk 384 or 512.

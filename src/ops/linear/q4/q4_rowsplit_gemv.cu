@@ -40,3 +40,16 @@ void launch_q4_gemv_r1_w8_direct(const Tensor& x, const Weight& w, Tensor& out,
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops::detail {
+
+// Fork: K-specialized R1W8 GEMV launches (StaticGroupsPerRow must equal k/64).
+void launch_q4_gemv_r1_w8_k6144(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_gemv<Q4GemvR1W8K6144Schedule>(x, w, out, stream);
+}
+
+void launch_q4_gemv_r1_w8_k17408(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_gemv<Q4GemvR1W8K17408Schedule>(x, w, out, stream);
+}
+
+} // namespace ninfer::ops::detail
