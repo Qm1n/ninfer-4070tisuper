@@ -34,16 +34,19 @@ RESOURCE_SPECS = qwen3_6_inventory.RESOURCE_SPECS
 
 
 def _a5000_endpoint_and_down(spec: TensorSpec) -> TensorSpec:
-    """Fork tuning for 16 GB VRAM: Q6 vocabulary endpoints and Q4 MLP down.
+    """Fork tuning for 16 GB VRAM: minimal all-Q4 layout.
 
-    Q6 endpoints save 0.86 GiB versus W8 (the engine's embed gather has a Q6
-    route and the output head runs through ops::linear). value_z/output stay
-    Q5 (fused attention-input kernels). mlp/down is Q4 via the fork's
-    q4_linear_add residual kernels (saves 0.70 GiB versus Q5).
+    Everything large is Q4G64_F16S: MLP, GDN/attention inputs (via the fork's
+    q4_q4 fused input kernels), outputs (q4_linear_add), and the output head
+    (ops::linear dispatch admits n=248320). token_embedding stays Q6 until a
+    Q4 gather route exists (Phase 2).
     """
-    if spec.name in ("text/token_embedding", "text/output_head"):
+    if spec.name == "text/output_head":
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q4)
+    if spec.name == "text/token_embedding":
         return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q6)
-    if spec.name.endswith("mlp/down") or spec.name.endswith("/output"):
+    if spec.name.endswith(("mlp/down", "mlp/gate_up", "/output",
+                           "gdn/value_z", "attention/gate_value")):
         return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q4)
     return spec
 

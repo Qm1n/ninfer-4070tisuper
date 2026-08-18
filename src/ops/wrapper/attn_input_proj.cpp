@@ -3,6 +3,7 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/q4_q4/q4_q4_attn_input_plan.h" // Fork: Q4/Q4 operand pair.
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -231,10 +232,18 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
-    require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
-
-    detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream);
+    // Fork: Admit a closed Q4/Q4 branch while preserving the existing Q4/Q5 route unchanged.
+    if (gate_value_weight.qtype == QType::Q4G64_F16S) {
+        require_rowsplit(gate_value_weight, QType::Q4G64_F16S, kQRows + kKvRows,
+                         "gate/value weight");
+        detail::q4_q4_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                          stream);
+    } else {
+        require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows,
+                         "gate/value weight");
+        detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                          stream);
+    }
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

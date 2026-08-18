@@ -48,6 +48,22 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }
 
+// Fork: split endpoint formats so the output head can drop to Q4 (ops::linear
+// dispatch admits n=248320) while the embedding stays Q6 until a Q4 gather
+// route exists.
+NumericFormat head_format(WeightsProfile weights_profile) {
+    switch (weights_profile) {
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen36Nvfp4:
+        return endpoint_format(weights_profile);
+    case WeightsProfile::Qwen38GroupwiseInt:
+        return NumericFormat::Q4G64_F16S;
+    case WeightsProfile::Qwen38Nvfp4:
+        return NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    }
+    throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+}
+
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
                           std::string_view label) {
     if (offset > bytes.size() || bytes.size() - static_cast<std::size_t>(offset) < 4) {
@@ -216,7 +232,9 @@ load_gdn_control_projection(const GdnPlan& plan,
     };
 }
 
-void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
+// Fork: Qwen3.8 uses the newly admitted Q4/Q4 input-projection pair; Qwen3.6 retains Q4/Q5.
+void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out,
+                                NumericFormat second_input_format) {
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -228,7 +246,7 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 .query_key  = bind_weight(binder, prefix + "attention/query_key",
                                           NumericFormat::Q4G64_F16S, {7168, 5120}),
                 .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::Q5G64_F16S, {7168, 5120}),
+                                          second_input_format, {7168, 5120}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
@@ -253,8 +271,8 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.gdn.input_projection = SplitGdnInputProjectionPlan{
                 .query_key = bind_weight(binder, prefix + "gdn/query_key",
                                          NumericFormat::Q4G64_F16S, {4096, 5120}),
-                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::Q5G64_F16S,
-                                         {12288, 5120}),
+                .value_z = bind_weight(binder, prefix + "gdn/value_z", second_input_format,
+                                       {12288, 5120}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
@@ -428,8 +446,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+        // Fork: Preserve the registered Qwen3.6 Q4/Q5 artifact contract.
+        bind_groupwise_text_layers(binder, out, NumericFormat::Q5G64_F16S);
+        break;
     case WeightsProfile::Qwen38GroupwiseInt:
-        bind_groupwise_text_layers(binder, out);
+        // Fork: Bind Qwen3.8 gate/value and value/z parents as Q4G64_F16S.
+        bind_groupwise_text_layers(binder, out, NumericFormat::Q4G64_F16S);
         break;
     case WeightsProfile::Qwen36Nvfp4:
         bind_nvfp4_text_layers(binder, out);
@@ -442,7 +464,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    out.output_head =
+        bind_weight(binder, "text/output_head", head_format(weights_profile), {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;

@@ -23,7 +23,7 @@ namespace ninfer::ops {
  * Logical shapes:
  *   x [5120,T], qk weight/output rows 4096, value/z rows 6144 each, qkv [10240,T],
  *   z [6144,T]. T may be any positive value. x, qkv, and z are contiguous BF16.
- *   qk_weight is Q4G64_F16S RowSplit [4096,5120] and value_z_weight is one
+ *   qk_weight is Q4G64_F16S RowSplit [4096,5120] and value_z_weight is one Q4G64_F16S or
  *   Q5G64_F16S RowSplit parent [12288,5120] in [value,z] row order, both with FP16 scales.
  *
  * Numeric:
@@ -39,6 +39,7 @@ namespace ninfer::ops {
  * Workspace:
  *   No transient bytes are required.
  */
+// Fork: The two-parent GDN contract admits both Q4/Q4 and Q4/Q5 operand pairs.
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
 
@@ -79,12 +80,13 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     cudaStream_t stream);
 
 /**
- * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8
- * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
- * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
+ * Returns the transient capacity required by the registered two-parent Q4/Q4, Q4/Q5, or
+ * single-parent W8 snapshot profile. `batch_size` is exact and the query covers every W in the
+ * inclusive width interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
  * projection plus one BF16 [C,B*W] projected plane. The query throws for an unregistered row
  * profile or unsupported B/W domain.
  */
+// Fork: The shape-only snapshot planner covers Q4/Q4 and Q4/Q5 with identical capacity routes.
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
@@ -110,8 +112,8 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   width-three history to snapshot_base_slots[b]+j. Z bypasses convolution.
  *
  * Logical shapes:
- *   The 27B registered form has x [5120,W,B], Q4 q/k weight [4096,5120], one Q5 value/z parent
- *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
+ *   The 27B registered form has x [5120,W,B], Q4 q/k weight [4096,5120], one Q4 or Q5 value/z
+ *   parent [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
  *   value/z [6144,W,B], and I32 selectors [B]. B=1 accepts every positive W; B=2..8 accepts
  *   W=1..16. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
  *   A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
@@ -122,8 +124,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   snapshots are promoted and compared directly with those ideal values; their final storage
  *   rounding belongs to the Op's named A16 criterion, not the oracle. Former unfused projection
  *   tensors are not observable cast boundaries; production routes use their natural private
- *   accumulator and staging precision. This two-parent Q4/Q5 form does not quantize activation;
- *   the single-parent policy-bearing form below defines its own permitted compute profiles.
+ *   accumulator and staging precision. These two-parent Q4/Q4 and Q4/Q5 forms do not quantize
+ *   activation; the single-parent policy-bearing form below defines its own permitted compute
+ *   profiles.
  *
  * Effects:
  *   Each row writes query/key/value through its valid prefix and exact zero to its invalid tail;
@@ -133,6 +136,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   destination after that initial history has been loaded. Other slots are unchanged. Newly
  *   projected convolution channels remain private to the call while published snapshots are BF16.
  */
+// Fork: Snapshot admission and fused/materialized execution cover Q4/Q4 and Q4/Q5.
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Weight& value_z_weight, const Tensor& conv_weight,
                                   Tensor& conv_states, const Tensor& valid_columns,
@@ -172,11 +176,12 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   cudaStream_t stream);
 
 /**
- * Returns the transient capacity for the registered Q4/Q5 or W8 record-producing profile.
+ * Returns the transient capacity for the registered Q4/Q4, Q4/Q5, or W8 record-producing profile.
  * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..8,
  * T=2..16 execution domain. These profiles require no transient storage because materialized
  * projection writes directly to caller-owned conv_record.
  */
+// Fork: The shape-only record planner covers Q4/Q4 and Q4/Q5 with zero transient storage.
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
@@ -204,9 +209,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
  * modified. Only the valid prefix of conv_record is semantically defined.
  *
- * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
+ * The two-parent form registers Q4 q/k [4096,5120] and a Q4 or Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
  */
+// Fork: Record admission and fused/materialized execution cover Q4/Q4 and Q4/Q5.
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Weight& value_z_weight, const Tensor& conv_weight,
                                 const Tensor& conv_states, const Tensor& valid_columns,

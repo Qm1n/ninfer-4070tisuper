@@ -21,14 +21,16 @@ namespace ninfer::ops {
  * All tensors are contiguous BF16. Shapes are x [5120,T], q/gate [6144,T], and k/v [1024,T].
  * T may be any positive value.
  * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
- * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
- * evaluates every projection naively in FP64 from the represented inputs. The BF16 outputs are
+ * query_key is Q4G64_F16S and gate_value is Q4G64_F16S or Q5G64_F16S. The oracle exact-decodes
+ * each row and evaluates every projection naively in FP64 from the represented inputs. The BF16
+ * outputs are
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
  * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
  * Current registered routes require no transient allocation. The Op has no persistent state side
  * effect.
  */
+// Fork: The two-parent attention contract admits both Q4/Q4 and Q4/Q5 operand pairs.
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream);

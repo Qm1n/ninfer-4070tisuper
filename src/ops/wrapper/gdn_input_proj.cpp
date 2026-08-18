@@ -6,6 +6,8 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
+#include "ops/gdn_input_proj/q4_q4/q4_q4_gdn_input_kernels.h" // Fork: Q4/Q4 entry points.
+#include "ops/gdn_input_proj/q4_q4/q4_q4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
@@ -349,6 +351,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
 
 detail::Q4Q5GdnInputConvPlan resolve_q4_q5_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
     return detail::q4_q5_gdn_input_conv_resolve_plan({5120, 4096, 12288, 10240, 6144, 5120, tokens},
+                                                     batch_size);
+}
+
+// Fork: Resolve the parallel Q4/Q4 convolution route catalog.
+detail::Q4Q4GdnInputConvPlan resolve_q4_q4_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
+    return detail::q4_q4_gdn_input_conv_resolve_plan({5120, 4096, 12288, 10240, 6144, 5120, tokens},
                                                      batch_size);
 }
 
@@ -731,9 +739,14 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_matrix(qkv, kQkvRows, cols, "qkv");
     require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
-
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    // Fork: Admit Q4/Q4 while leaving the existing Q4/Q5 dispatch intact.
+    if (value_z_weight.qtype == QType::Q4G64_F16S) {
+        require_rowsplit(value_z_weight, QType::Q4G64_F16S, kParentRows, "value/z weight");
+        detail::q4_q4_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    } else {
+        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
+        detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    }
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -796,6 +809,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         if (q4_q5) {
             (void)resolve_q4_q5_conv_plan(min_width, batch_size);
             (void)resolve_q4_q5_conv_plan(max_width, batch_size);
+            // Fork: The shape-only workspace contract also covers Q4/Q4 operands.
+            (void)resolve_q4_q4_conv_plan(min_width, batch_size);
+            (void)resolve_q4_q4_conv_plan(max_width, batch_size);
         } else {
             (void)resolve_w8_conv_plan(min_width, batch_size);
             (void)resolve_w8_conv_plan(max_width, batch_size);
@@ -807,6 +823,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, 1);
         (void)resolve_q4_q5_conv_plan(max_width, 1);
+        // Fork: Keep Q4/Q4 materialization capacity aligned with its parallel plan.
+        (void)resolve_q4_q4_conv_plan(min_width, 1);
+        (void)resolve_q4_q4_conv_plan(max_width, 1);
         if (max_width >= 7) {
             largest_materialized_width = max_width;
         } else if (min_width <= 4 && max_width >= 4) {
@@ -866,6 +885,9 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, batch_size);
         (void)resolve_q4_q5_conv_plan(max_width, batch_size);
+        // Fork: Record workspace admission covers the Q4/Q4 plan as well.
+        (void)resolve_q4_q4_conv_plan(min_width, batch_size);
+        (void)resolve_q4_q4_conv_plan(max_width, batch_size);
     } else {
         (void)resolve_w8_conv_plan(min_width, batch_size);
         (void)resolve_w8_conv_plan(max_width, batch_size);
@@ -923,7 +945,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
     const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
+    // Fork: Require a fully validated Q4 second operand only on the Q4/Q4 branch.
+    const bool q4_q4 = value_z_weight.qtype == QType::Q4G64_F16S;
+    require_rowsplit(value_z_weight,
+                     q4_q4 ? QType::Q4G64_F16S : QType::Q5G64_F16S, kParentRows,
+                     "value/z weight");
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
                               snapshot_base_slots, kChannels, geometry);
     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
@@ -945,13 +971,25 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
         return;
     }
 
-    const detail::Q4Q5GdnInputConvPlan plan =
-        resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
-        detail::q4_q5_gdn_input_conv_snapshot_launch(
-            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
-            initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
-        return;
+    // Fork: Select the matching fused Q4/Q4 or existing Q4/Q5 convolution route.
+    if (q4_q4) {
+        const detail::Q4Q4GdnInputConvPlan plan =
+            resolve_q4_q4_conv_plan(geometry.width, geometry.batch);
+        if (plan.schedule == detail::Q4Q4GdnInputConvScheduleId::ProjectionEpilogueFused) {
+            detail::q4_q4_gdn_input_conv_snapshot_launch(
+                x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
+                initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
+            return;
+        }
+    } else {
+        const detail::Q4Q5GdnInputConvPlan plan =
+            resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+        if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+            detail::q4_q5_gdn_input_conv_snapshot_launch(
+                x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
+                initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
+            return;
+        }
     }
 
     auto scope                 = ws.scope();
@@ -977,7 +1015,11 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
     const ConvGeometry geometry        = require_record_input(x, kHidden);
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
+    // Fork: Require a fully validated Q4 second operand only on the Q4/Q4 branch.
+    const bool q4_q4 = value_z_weight.qtype == QType::Q4G64_F16S;
+    require_rowsplit(value_z_weight,
+                     q4_q4 ? QType::Q4G64_F16S : QType::Q5G64_F16S, kParentRows,
+                     "value/z weight");
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
                             geometry);
     require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
@@ -993,13 +1035,25 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                               conv_record, query, key, value, z, workspace);
 
-    const detail::Q4Q5GdnInputConvPlan plan =
-        resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
-        detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
-                                                   conv_states, valid_columns, initial_state_slots,
-                                                   conv_record, query, key, value, z, stream);
-        return;
+    // Fork: Select the matching fused Q4/Q4 or existing Q4/Q5 record route.
+    if (q4_q4) {
+        const detail::Q4Q4GdnInputConvPlan plan =
+            resolve_q4_q4_conv_plan(geometry.width, geometry.batch);
+        if (plan.schedule == detail::Q4Q4GdnInputConvScheduleId::ProjectionEpilogueFused) {
+            detail::q4_q4_gdn_input_conv_record_launch(
+                x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
+                initial_state_slots, conv_record, query, key, value, z, stream);
+            return;
+        }
+    } else {
+        const detail::Q4Q5GdnInputConvPlan plan =
+            resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+        if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+            detail::q4_q5_gdn_input_conv_record_launch(
+                x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
+                initial_state_slots, conv_record, query, key, value, z, stream);
+            return;
+        }
     }
     compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
                    query, key, value, z, geometry, workspace, stream,

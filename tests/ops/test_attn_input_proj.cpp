@@ -68,7 +68,10 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
+    // Fork: Name the two admitted operand pairs independently in conformance output.
+    const std::string suffix =
+        std::string(gate_value.host.weight.qtype == QType::Q4G64_F16S ? " Q4/Q4" : " Q4/Q5") +
+        " A16 T=" + std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, query_key.host, 0, kQRows, activation,
                               kHidden, tokens);
@@ -94,6 +97,22 @@ int run_q4_q5() {
 
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+        failures += run_q4_q5_case(query_key, gate_value, tokens);
+    }
+    return failures;
+}
+
+// Fork: Cover Q4/Q4 attention projection at every small/large-T route boundary.
+int run_q4_q4() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kParent = 7168;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 109U));
+    DevicePackedWeight gate_value(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 113U));
+
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 128}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
@@ -494,11 +513,20 @@ int main() {
         return 77;
     }
 
+    // Fork: NVFP4/FP8 conformance cannot run on non-Blackwell fork builds (stubs throw).
+    const bool fork_blackwell = [] {
+        int dev = 0, maj = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return maj >= 12;
+    }();
     int failures = 0;
     failures += run_q4_q5();
+    // Fork: Exercise the newly admitted Q4/Q4 operand pair through the public wrapper.
+    failures += run_q4_q4();
     failures += run_bf16_target();
-    failures += run_nvfp4_target();
-    failures += run_fp8_target();
+    if (fork_blackwell) { failures += run_nvfp4_target(); }
+    if (fork_blackwell) { failures += run_fp8_target(); }
     failures += run_w8_target();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";

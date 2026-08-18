@@ -480,9 +480,12 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
                                               token_activation, kHidden);
         });
     const std::vector<std::uint16_t> state_after = state.bits();
-    const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
-                               " initial=" + std::to_string(initial_slot) +
-                               " base=" + std::to_string(kSnapshotBaseSlot);
+    // Fork: Identify Q4/Q4 and Q4/Q5 snapshot operands independently.
+    const std::string suffix =
+        std::string(value_z_weight.host.weight.qtype == QType::Q4G64_F16S ? " Q4/Q4" :
+                                                                            " Q4/Q5") +
+        " A16 T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
+        " base=" + std::to_string(kSnapshotBaseSlot);
     int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
@@ -555,6 +558,20 @@ int run_q4_q5() {
         });
     failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
     failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
+    return failures;
+}
+
+// Fork: Cover Q4/Q4 snapshot decode, fixed projection-epilogue, materialized, and grouped routes.
+int run_q4_q4() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 641U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 12288, kHidden, 643U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 128}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1);
+    }
     return failures;
 }
 
@@ -993,6 +1010,13 @@ int main() {
         return 77;
     }
 
+    // Fork: NVFP4/FP8 conformance cannot run on non-Blackwell fork builds (stubs throw).
+    const bool fork_blackwell = [] {
+        int dev = 0, maj = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return maj >= 12;
+    }();
     int failures = 0;
     const std::size_t q4_interval =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
@@ -1012,42 +1036,46 @@ int main() {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
-    const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
-        nvfp4_a4_4 == 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
-        std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
-        ++failures;
-    }
-    const auto fp8_snapshot_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
-                                          std::int32_t min_width, std::int32_t max_width) {
-        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, min_width, max_width);
-    };
-    const std::size_t fp8_a16_w4 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 4, 4);
-    const std::size_t fp8_a16_w6 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 6, 6);
-    const std::size_t fp8_a8_w10 = fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 10, 10);
-    if (fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 1, 3) != 0 || fp8_a16_w4 == 0 ||
-        fp8_a16_w6 <= fp8_a16_w4 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 7, 10) != 0 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 1, 9) != fp8_a16_w6 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 11, 11) == 0 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 7, 9) != 0 || fp8_a8_w10 == 0 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 1, 10) != fp8_a8_w10 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 2, 5, 5) <=
-            fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 2, 4, 4)) {
-        std::cerr << "FP8 snapshot capacity did not preserve measured route witnesses\n";
-        ++failures;
+    if (fork_blackwell) {
+        const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
+        if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
+            nvfp4_a4_4 == 0 ||
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
+            std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
+            ++failures;
+        }
+        const auto fp8_snapshot_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
+                                              std::int32_t min_width, std::int32_t max_width) {
+            return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, min_width, max_width);
+        };
+        const std::size_t fp8_a16_w4 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 4, 4);
+        const std::size_t fp8_a16_w6 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 6, 6);
+        const std::size_t fp8_a8_w10 = fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 10, 10);
+        if (fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 1, 3) != 0 || fp8_a16_w4 == 0 ||
+            fp8_a16_w6 <= fp8_a16_w4 ||
+            fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 7, 10) != 0 ||
+            fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 1, 9) != fp8_a16_w6 ||
+            fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 11, 11) == 0 ||
+            fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 7, 9) != 0 || fp8_a8_w10 == 0 ||
+            fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 1, 10) != fp8_a8_w10 ||
+            fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 2, 5, 5) <=
+                fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 2, 4, 4)) {
+            std::cerr << "FP8 snapshot capacity did not preserve measured route witnesses\n";
+            ++failures;
+        }
     }
     failures += run_q4_q5();
+    // Fork: Exercise the Q4/Q4 snapshot route against the existing FP32 oracle.
+    failures += run_q4_q4();
     failures += run_w8();
-    failures += run_nvfp4();
-    failures += run_fp8();
+    if (fork_blackwell) { failures += run_nvfp4(); }
+    if (fork_blackwell) { failures += run_fp8(); }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

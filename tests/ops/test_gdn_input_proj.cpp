@@ -53,7 +53,10 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
+    // Fork: Identify Q4/Q4 and Q4/Q5 operand pairs independently in conformance output.
+    const std::string suffix =
+        std::string(value_z_weight.host.weight.qtype == QType::Q4G64_F16S ? " Q4/Q4" : " Q4/Q5") +
+        " A16 T=" + std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -78,6 +81,20 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens);
+    }
+    return failures;
+}
+
+// Fork: Cover Q4/Q4 GDN projection at every independent/grouped-MMA boundary.
+int run_q4_q4() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 421U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 12288, kHidden, 431U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 128}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
     return failures;
@@ -320,11 +337,20 @@ int main() {
         return 77;
     }
 
+    // Fork: NVFP4/FP8 conformance cannot run on non-Blackwell fork builds (stubs throw).
+    const bool fork_blackwell = [] {
+        int dev = 0, maj = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return maj >= 12;
+    }();
     int failures = 0;
     failures += run_q4_q5();
+    // Fork: Exercise the newly admitted Q4/Q4 operands through the public GDN wrapper.
+    failures += run_q4_q4();
     failures += run_w8();
-    failures += run_nvfp4();
-    failures += run_fp8();
+    if (fork_blackwell) { failures += run_nvfp4(); }
+    if (fork_blackwell) { failures += run_fp8(); }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

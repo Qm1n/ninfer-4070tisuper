@@ -180,6 +180,13 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
                   record_k, record_v, record_z_view, record_workspace);
     cuda_synchronize();
 
+    // Fork: NVFP4/FP8 conformance cannot run on non-Blackwell fork builds (stubs throw).
+    const bool fork_blackwell = [] {
+        int dev = 0, maj = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return maj >= 12;
+    }();
     int failures = 0;
     failures +=
         verify_equal(std::string(label) + " query", snapshot_query.bits(), record_query.bits());
@@ -267,6 +274,53 @@ int run_q4_q5() {
     failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1451U);
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
+    return failures;
+}
+
+// Fork: Cover Q4/Q4 record fused and materialized routes over the valid T domain.
+int run_q4_q4() {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    DevicePackedWeight qk(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 1461U));
+    DevicePackedWeight value_z(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 12288, kHidden, 1463U));
+
+    int failures   = 0;
+    const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
+                         std::uint32_t seed) {
+        const std::size_t snapshot_bytes =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+        const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            kQueryRows, kKeyRows, kValueRows, batch, width, width);
+        return run_case(
+            "Q4/Q4 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
+            kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, qk.view(), value_z.view(), conv, state,
+                                                  valid_columns, initial, snapshot_base, q, k, v, z,
+                                                  workspace, nullptr);
+            },
+            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
+                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
+                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, state,
+                                                valid_columns, initial, record, q, k, v, z,
+                                                workspace, nullptr);
+            },
+            seed);
+    };
+    failures += run(2, 1, {}, 1471U);
+    failures += run(4, 1, {3}, 1473U);
+    failures += run(8, 1, {}, 1475U);
+    failures += run(16, 1, {}, 1477U);
+    failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1479U);
+    failures += qk.verify_preserved("Q4/Q4 record qk weight");
+    failures += value_z.verify_preserved("Q4/Q4 record value/z weight");
     return failures;
 }
 
@@ -547,7 +601,15 @@ int main() {
         return 77;
     }
 
-    int failures                   = 0;
+        // Fork: NVFP4/FP8 conformance cannot run on non-Blackwell fork builds (stubs throw).
+    const bool fork_blackwell = [] {
+        int dev = 0, maj = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return maj >= 12;
+    }();
+int failures                   = 0;
+    if (fork_blackwell) {
     const auto fp8_record_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                         std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -563,10 +625,13 @@ int main() {
         std::cerr << "FP8 record capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+    }
     failures += run_q4_q5();
+    // Fork: Exercise the newly admitted Q4/Q4 record entry point.
+    failures += run_q4_q4();
     failures += run_w8();
-    failures += run_nvfp4();
-    failures += run_fp8();
+    if (fork_blackwell) { failures += run_nvfp4(); }
+    if (fork_blackwell) { failures += run_fp8(); }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }
