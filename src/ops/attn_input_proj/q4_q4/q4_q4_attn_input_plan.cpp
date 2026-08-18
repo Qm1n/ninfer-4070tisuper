@@ -26,11 +26,8 @@ constexpr std::array<RouteSpec, 3> kRoutes{{
 }};
 
 bool supported_shape(const Q4Q4AttnInputProblem& problem) noexcept {
-    const bool qwen3_6_27b = problem.input_rows == 5120 && problem.query_rows == 6144 &&
-                             problem.kv_rows == 1024 && problem.padded_k == 5120;
-    const bool qwen3_5_9b = problem.input_rows == 4096 && problem.query_rows == 4096 &&
-                            problem.kv_rows == 1024 && problem.padded_k == 4096;
-    return qwen3_6_27b || qwen3_5_9b;
+    return problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
+           problem.padded_k == 5120;
 }
 
 } // namespace

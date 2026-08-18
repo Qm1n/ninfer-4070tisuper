@@ -29,11 +29,6 @@ std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
-bool head_pair_admits(std::int32_t q_heads, std::int32_t kv_heads) {
-    return (q_heads == 24 && kv_heads == 4) || (q_heads == 16 && kv_heads == 2) ||
-           (q_heads == 16 && kv_heads == 4);
-}
-
 void require_kv_heads(std::int32_t kv_heads, const char* op) {
     if (kv_heads != 4 && kv_heads != 2) {
         throw std::invalid_argument(std::string(op) + ": unsupported KV head geometry");
@@ -196,10 +191,7 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
         throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
     }
     const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = cache.num_kv_heads;
-    if (!head_pair_admits(q_heads, kv_heads)) {
-        throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry pair");
-    }
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
     const std::int32_t tokens   = q.ne[2];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
     require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
@@ -231,10 +223,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
     }
     const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = cache.num_kv_heads;
-    if (!head_pair_admits(q_heads, kv_heads)) {
-        throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry pair");
-    }
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
     if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
@@ -283,13 +272,13 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
 
 template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
-                            std::int32_t kv_heads, DType cache_dtype, GqaExecutionEnvelope envelope,
-                            Tensor& out, Launch&& launch) {
+                            DType cache_dtype, GqaExecutionEnvelope envelope, Tensor& out,
+                            Launch&& launch) {
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
-            detail::gqa_attention_split_capacity(q.ne[1], kv_heads, count, cache_dtype, envelope);
+            detail::gqa_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits);
         Tensor q_chunk          = q.slice(2, begin, count);
         Tensor position_chunk   = positions.slice(0, begin, count);
@@ -307,8 +296,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
-            detail::gqa_attention_split_capacity(q.ne[1], cache.num_kv_heads, count, cache.dtype,
-                                                 envelope);
+            detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
@@ -321,7 +309,7 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
                                    const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     for_each_small_t_chunk(
-        q, positions, workspace, cache.num_kv_heads, cache.dtype, envelope, out,
+        q, positions, workspace, cache.dtype, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
             detail::gqa_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
@@ -366,10 +354,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
-    if (!head_pair_admits(q_heads, kv_heads_for_q_heads(q_heads, "gqa_attention workspace")) &&
-        q_heads != 16) {
-        throw std::invalid_argument("gqa_attention workspace: unsupported Q/KV head geometry");
-    }
+    (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
@@ -381,7 +366,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
-            detail::gqa_attention_split_capacity(q_heads, kv_heads, width, cache_dtype, envelope);
+            detail::gqa_attention_split_capacity(q_heads, width, cache_dtype, envelope);
         WorkspaceLayoutBuilder layout;
         (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
@@ -421,10 +406,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
-    const std::int32_t kv_heads = k.ne[1];
-    if (!head_pair_admits(q.ne[1], kv_heads)) {
-        throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry pair");
-    }
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q.ne[1], op);
     require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
@@ -440,7 +422,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     if (route == detail::GqaAttentionRoute::SmallT) {
         const std::int32_t splits =
-            detail::gqa_attention_split_capacity(q.ne[1], cache.num_kv_heads, width, cache.dtype, envelope);
+            detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
@@ -492,7 +474,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     }
     if (detail::gqa_attention_uses_small_t(q.ne[2])) {
         const std::int32_t splits =
-            detail::gqa_attention_split_capacity(q.ne[1], cache.num_kv_heads, q.ne[2], cache.dtype, envelope);
+            detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
                                                     partial.acc, partial.m, partial.l, out, stream);

@@ -31,16 +31,16 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
     }
 }
 
-void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, std::int32_t hidden, const char* label) {
+void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
     const bool q4_planes =
         qtype != QType::Q4G64_F16S || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
     const bool q5_planes =
         qtype != QType::Q5G64_F16S || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
     if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
-        weight.shape[1] != hidden || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != hidden || !q4_planes || !q5_planes ||
+        weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
+        weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
         (qtype == QType::Q5G64_F16S && !aligned_to(weight.qhigh, 16))) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
@@ -222,34 +222,24 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
-    const std::int32_t hidden   = x.ne[0];
-    const std::int32_t q_rows   = q.ne[0];
-    const std::int32_t kv_rows  = k.ne[0];
-    const bool qwen3_6_27b      = hidden == 5120 && q_rows == 6144 && kv_rows == 1024;
-    const bool qwen3_5_9b       = hidden == 4096 && q_rows == 4096 && kv_rows == 1024;
-    if (!qwen3_6_27b && !qwen3_5_9b) {
-        throw std::invalid_argument("attn_input_proj: unsupported split projection geometry");
-    }
-    const std::int32_t cols = x.ne[1];
-    require_matrix(x, hidden, cols, "x");
-    require_matrix(q, q_rows, cols, "q");
-    require_matrix(gate, q_rows, cols, "gate");
-    require_matrix(k, kv_rows, cols, "k");
-    require_matrix(v, kv_rows, cols, "v");
-    require_rowsplit(query_key_weight, QType::Q4G64_F16S, q_rows + kv_rows, hidden,
-                     "query/key weight");
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t cols        = x.ne[1];
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
     // Fork: Admit a closed Q4/Q4 branch while preserving the existing Q4/Q5 route unchanged.
     if (gate_value_weight.qtype == QType::Q4G64_F16S) {
-        require_rowsplit(gate_value_weight, QType::Q4G64_F16S, q_rows + kv_rows, hidden,
+        require_rowsplit(gate_value_weight, QType::Q4G64_F16S, kQRows + kKvRows,
                          "gate/value weight");
         detail::q4_q4_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                           stream);
     } else {
-        if (!qwen3_6_27b) {
-            throw std::invalid_argument(
-                "attn_input_proj: Q4/Q5 split projection admits only the 27B geometry");
-        }
-        require_rowsplit(gate_value_weight, QType::Q5G64_F16S, q_rows + kv_rows, hidden,
+        require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows,
                          "gate/value weight");
         detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                           stream);

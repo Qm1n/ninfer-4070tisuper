@@ -53,13 +53,11 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
 template <class Schedule>
 void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
                   Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
-    const bool full       = (x.ne[1] % Schedule::BN) == 0;
-    const std::int32_t split = q.ne[0];
-    const std::int32_t tail  = k.ne[0];
-    launch_pair<Schedule>(full, x, make_job(query_key_weight, 0, split, q),
-                          make_job(query_key_weight, split, tail, k), stream);
-    launch_pair<Schedule>(full, x, make_job(gate_value_weight, 0, split, gate),
-                          make_job(gate_value_weight, split, tail, v), stream);
+    const bool full = (x.ne[1] % Schedule::BN) == 0;
+    launch_pair<Schedule>(full, x, make_job(query_key_weight, 0, 6144, q),
+                          make_job(query_key_weight, 6144, 1024, k), stream);
+    launch_pair<Schedule>(full, x, make_job(gate_value_weight, 0, 6144, gate),
+                          make_job(gate_value_weight, 6144, 1024, v), stream);
 }
 
 template <class Schedule>

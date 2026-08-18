@@ -217,20 +217,16 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
-std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
-                                          std::int32_t tokens, DType cache_dtype,
-                                          GqaExecutionEnvelope envelope) {
+std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
+                                          DType cache_dtype, GqaExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
-    if (q_heads == Gqa27Geometry::QHeads && kv_heads == Gqa27Geometry::KVHeads) {
+    if (q_heads == Gqa27Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
     }
-    if (q_heads == Gqa9BGeometry::QHeads && kv_heads == Gqa9BGeometry::KVHeads) {
-        return gqa_small_t_launch_capacity<Gqa9BGeometry>(envelope, tokens, cache_dtype);
-    }
-    if (q_heads == Gqa35Geometry::QHeads && kv_heads == Gqa35Geometry::KVHeads) {
+    if (q_heads == Gqa35Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
     }
     throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
@@ -365,14 +361,8 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .width         = width,
         .batch_size    = q.ne[3],
     };
-    if (q.ne[1] == Gqa27Geometry::QHeads && cache.num_kv_heads == Gqa27Geometry::KVHeads) {
+    if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m, partial_l,
-                                                        out, stream);
-        return;
-    }
-    if (q.ne[1] == Gqa9BGeometry::QHeads && cache.num_kv_heads == Gqa9BGeometry::KVHeads) {
-        gqa_attention_small_t_launch_for<Gqa9BGeometry>(q, input, pos, scale, cache, invocation,
                                                         envelope, partial_acc, partial_m, partial_l,
                                                         out, stream);
         return;
@@ -397,16 +387,8 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         .batch_size    = 1,
     };
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
-    if (q.ne[1] == Gqa27Geometry::QHeads &&
-        batch_cache.num_kv_heads == Gqa27Geometry::KVHeads) {
+    if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
-                                                        invocation, envelope, partial_acc,
-                                                        partial_m, partial_l, out, stream);
-        return;
-    }
-    if (q.ne[1] == Gqa9BGeometry::QHeads &&
-        batch_cache.num_kv_heads == Gqa9BGeometry::KVHeads) {
-        gqa_attention_small_t_launch_for<Gqa9BGeometry>(q, input, pos, scale, batch_cache,
                                                         invocation, envelope, partial_acc,
                                                         partial_m, partial_l, out, stream);
         return;
