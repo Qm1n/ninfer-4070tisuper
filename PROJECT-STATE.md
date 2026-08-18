@@ -199,3 +199,42 @@ and Q3-class quality means codebook machinery (different project).
   `tools/convert/common/quantize.py` (quantize_matrix — the RTN math).
 - Tests: `tests/ops/linear_add/` (oracle harness), `tests/ops/quantized_weight.h` (patterned weights).
 - Benchmarks: `bench/` (upstream's own).
+
+## 10. min-Q4 EXECUTED (2026-08-18 evening) — QUALITY VERDICT IN
+
+New kernels (all oracle-verified on GPU, committed):
+- Q4/Q4 fused attention-input + GDN-input families (src/ops/{attn,gdn}_input_proj/q4_q4/ —
+  codex-drafted, I verified: OK attn_input_proj, OK gdn_input_proj, OK conv_snapshot,
+  OK conv_record, after guarding nvfp4/fp8 test cases for non-sm_120 builds).
+- Q4 output-head dispatch (n=248320 in q4_dispatch.cpp; head Q6→Q4, -0.296 GiB).
+- Engine: bind_groupwise_text_layers parameterized second-operand format (Qwen3.8 → Q4).
+
+Artifacts (external drive):
+- qwen3_8_27b_q4head.ninfer — head Q4: 20k no-spec / 8k MTP3 ctx.
+- qwen3_8_27b_minq4.ninfer (15.76 GiB file, ~13.76 GiB device text weights) — ALL-Q4
+  except Q6 embedding: 36k+ no-spec / 22k MTP3 ctx ceilings. Coherent output verified.
+  Decode 13.9 tok/s @32k; MTP3 25.8 tok/s @20k.
+
+Sim-PPL evaluator (tools/eval/): quant_gguf.py applies fork quant math to the BF16 GGUF
+(→ BF16 store, F32 control tensors preserved; orientation [N,K], groups axis 1, fused-row
+slicing per family), sweep.sh chains llama-quantize --pure Q8_0 + llama-perplexity
+(-ngl 30, 50×512 chunks). GGMLType=naming trap: use GGMLQuantizationType; tmux server
+dies randomly — use setsid.
+
+VERDICT (50 chunks, same protocol as anchor):
+| layout | PPL | Δ vs fp32 6.012 | Δ vs IQ3_XXS 6.256 |
+|---|---|---|---|
+| v2 sim | 6.218 | +0.21 | -0.04 (BETTER) |
+| min-Q4 sim | 6.299 | +0.29 | +0.04 (parity) |
+| Q3-MLP+Q4 sim | 7.049 | +1.04 | +0.79 — FAILS ≤0.5 gate |
+| all-Q3 sim | 8.028 | +2.02 | dead |
+
+Consequences:
+- min-Q4 is quality-free. THE layout. Remaining shrink path = Q4 embedding gather
+  (Phase 2, -0.3 GiB → ~40k+ MTP3) then nothing without new formats.
+- Q3-MLP rejected without activation-calibrated scales; even then needs to halve the gap.
+  Codex's 10.93 GiB recommendation is dead at RTN quality.
+- unsloth IQ3_XXS is genuinely good (imatrix+codebook >> RTN at 3 bits — confirmed empirically).
+
+Current stack of record: ~/ninfer-a5000 @ "sim-PPL verdict" commit;
+artifact /run/media/lio/data/g/qwen3_8_27b_minq4.ninfer.
