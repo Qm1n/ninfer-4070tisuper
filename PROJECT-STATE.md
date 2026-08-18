@@ -269,3 +269,29 @@ higher acceptance (architectural).
 
 Operational: prefill chunks >~600 tokens hit bf16_gdn_gating_proj cooperative-launch
 block limit (upstream kernel) — always pass --prefill-chunk 384 or 512.
+
+## 12. TARGETED OFFLOAD: pinned-host embedding (2026-08-18 late)
+
+The one offload that costs nothing: token_embedding {248320,5120} Q6 (~0.93 GiB) is read
+ONE ROW (~10 KiB) per token by the gather — pure PCIe scalar loads, invisible next to the
+12.7 GiB weight stream. Mechanism: Binder::retain_pinned_on_host (tensor-descriptor variant
+of retain_on_host) -> materializer cudaHostAlloc + memcpy, pointer stored in the object's
+`device` slot (UVA: device kernels dereference it zero-copy; device_data/materialized_weight/
+row_split_weight all work unchanged); MaterializedArtifact dtor cudaFreeHosts.
+
+MEASURED (minq4 artifact, tests green, coherent output):
+| metric | device-only | pinned-embed |
+|---|---|---|
+| device weights | 13.64 GiB | 12.71 GiB |
+| ctx ceiling no-spec | 36k | **61k** (73.7k fails) |
+| ctx ceiling MTP3 | 22k | **49k** (57.3k fails) |
+| MTP3 decode @40k | — | 25.7 tok/s (unchanged wall) |
+| prefill | 377 | 382 tok/s (unchanged) |
+
+General weight offload remains dead (bandwidth wall: any per-token-read tensor on host
+costs 10x its share). KV host offload not attempted (paged-device design; llama.cpp
+already sells that trade as its 262k mode).
+
+Daily-driver command updated:
+./apps/ninfer .../qwen3_8_27b_minq4.ninfer --kv-dtype int8 --max-context 49152 \
+  --kv-capacity 49152 --spec mtp --draft-tokens 3 --prefill-chunk 384
