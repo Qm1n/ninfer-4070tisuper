@@ -16,15 +16,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kQkRows     = 4096;
-constexpr std::int32_t kValueRows  = 6144;
-constexpr std::int32_t kZRows      = 6144;
-constexpr std::int32_t kValueZRows = kValueRows + kZRows;
-constexpr std::int32_t kHidden     = 5120;
-
 using Q4GdnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
 using Q4GdnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
 
+template <std::int32_t kQkRows, std::int32_t kHidden>
 void launch_qk_gemv(const Tensor& x, const Weight& weight, Tensor& qk, cudaStream_t stream) {
     using Schedule = Q4GemvR1W8DirectSchedule;
     const dim3 grid(static_cast<unsigned>(div_up(kQkRows, Schedule::kRowsPerCta)), 1u, 1u);
@@ -36,6 +31,7 @@ void launch_qk_gemv(const Tensor& x, const Weight& weight, Tensor& qk, cudaStrea
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <std::int32_t kValueRows, std::int32_t kValueZRows, std::int32_t kHidden>
 void launch_value_z_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                          cudaStream_t stream) {
     using Schedule = Q4GemvR1W8DirectSchedule;
@@ -49,6 +45,7 @@ void launch_value_z_gemv(const Tensor& x, const Weight& weight, Tensor& value, T
 }
 
 template <class Schedule, bool Full>
+template <std::int32_t kQkRows, std::int32_t kHidden, class Schedule, bool Full>
 void launch_qk_simt(const Tensor& x, const Weight& weight, Tensor& qk, cudaStream_t stream) {
     const std::int32_t cols   = x.ne[1];
     const std::int32_t out_ld = static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16));
@@ -62,6 +59,7 @@ void launch_qk_simt(const Tensor& x, const Weight& weight, Tensor& qk, cudaStrea
 }
 
 template <class Schedule, bool Full>
+template <std::int32_t kValueRows, std::int32_t kValueZRows, std::int32_t kHidden, class Schedule, bool Full>
 void launch_value_z_simt(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                          cudaStream_t stream) {
     const std::int32_t cols     = x.ne[1];
@@ -80,55 +78,64 @@ void launch_value_z_simt(const Tensor& x, const Weight& weight, Tensor& value, T
 }
 
 template <class Schedule>
+template <std::int32_t kQkRows, std::int32_t kHidden, class Schedule>
 void launch_qk_simt_route(const Tensor& x, const Weight& weight, Tensor& qk, cudaStream_t stream) {
     const bool full = (kQkRows % Schedule::kRowsPerCta) == 0 &&
                       ((kHidden / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
                       (x.ne[1] % Schedule::kColsPerTile) == 0;
     if (full) {
-        launch_qk_simt<Schedule, true>(x, weight, qk, stream);
+        launch_qk_simt<kQkRows, kHidden, Schedule, true>(x, weight, qk, stream);
     } else {
-        launch_qk_simt<Schedule, false>(x, weight, qk, stream);
+        launch_qk_simt<kQkRows, kHidden, Schedule, false>(x, weight, qk, stream);
     }
 }
 
 template <class Schedule>
+template <std::int32_t kValueRows, std::int32_t kValueZRows, std::int32_t kHidden, class Schedule>
 void launch_value_z_simt_route(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                                cudaStream_t stream) {
     const bool full = (kValueZRows % Schedule::kRowsPerCta) == 0 &&
                       ((kHidden / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
                       (x.ne[1] % Schedule::kColsPerTile) == 0;
     if (full) {
-        launch_value_z_simt<Schedule, true>(x, weight, value, z, stream);
+        launch_value_z_simt<kValueRows, kValueZRows, kHidden, Schedule, true>(x, weight, value, z,
+                                                                           stream);
     } else {
-        launch_value_z_simt<Schedule, false>(x, weight, value, z, stream);
+        launch_value_z_simt<kValueRows, kValueZRows, kHidden, Schedule, false>(x, weight, value,
+                                                                              z, stream);
     }
 }
 
+template <std::int32_t kQkRows, std::int32_t kHidden>
 void launch_qk(const Tensor& x, const Weight& weight, Tensor& qk, cudaStream_t stream) {
     if (x.ne[1] == 1) {
-        launch_qk_gemv(x, weight, qk, stream);
+        launch_qk_gemv<kQkRows, kHidden>(x, weight, qk, stream);
     } else if (x.ne[1] <= 4) {
-        launch_qk_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, qk, stream);
+        launch_qk_simt_route<kQkRows, kHidden, Q4GdnSimtR8C4Schedule>(x, weight, qk, stream);
     } else if (x.ne[1] <= 16) {
-        launch_qk_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, qk, stream);
+        launch_qk_simt_route<kQkRows, kHidden, Q4GdnSimtR8C8Schedule>(x, weight, qk, stream);
     } else {
         throw std::invalid_argument("Q4/Q4 GDN independent launch requires T in [1,16]");
     }
 }
 
+template <std::int32_t kValueRows, std::int32_t kValueZRows, std::int32_t kHidden>
 void launch_value_z(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
     if (x.ne[1] == 1) {
-        launch_value_z_gemv(x, weight, value, z, stream);
+        launch_value_z_gemv<kValueRows, kValueZRows, kHidden>(x, weight, value, z, stream);
     } else if (x.ne[1] <= 4) {
-        launch_value_z_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, value, z, stream);
+        launch_value_z_simt_route<kValueRows, kValueZRows, kHidden, Q4GdnSimtR8C4Schedule>(
+            x, weight, value, z, stream);
     } else if (x.ne[1] <= 16) {
-        launch_value_z_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, value, z, stream);
+        launch_value_z_simt_route<kValueRows, kValueZRows, kHidden, Q4GdnSimtR8C8Schedule>(
+            x, weight, value, z, stream);
     } else {
         throw std::invalid_argument("Q4/Q4 GDN independent launch requires T in [1,16]");
     }
 }
 
+template <std::int32_t kQkRows, std::int32_t kValueRows, std::int32_t kValueZRows, std::int32_t kHidden>
 void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                    Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
     using Schedule = Q4GdnSimtR8C4Schedule;
@@ -160,12 +167,27 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
 void q4_q4_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
-    if (x.ne[1] == 4) {
-        launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
+    if (qk_weight.k == 5120 && value_z_weight.k == 5120 && value_z_weight.n == 12288) {
+        if (x.ne[1] == 4) {
+            launch_t4_pdl<4096, 6144, 12288, 5120>(x, qk_weight, value_z_weight, qk, value, z,
+                                                    stream);
+            return;
+        }
+        launch_qk<4096, 5120>(x, qk_weight, qk, stream);
+        launch_value_z<6144, 12288, 5120>(x, value_z_weight, value, z, stream);
         return;
     }
-    launch_qk(x, qk_weight, qk, stream);
-    launch_value_z(x, value_z_weight, value, z, stream);
+    if (qk_weight.k == 4096 && value_z_weight.k == 4096 && value_z_weight.n == 8192) {
+        if (x.ne[1] == 4) {
+            launch_t4_pdl<4096, 4096, 8192, 4096>(x, qk_weight, value_z_weight, qk, value, z,
+                                                   stream);
+            return;
+        }
+        launch_qk<4096, 4096>(x, qk_weight, qk, stream);
+        launch_value_z<4096, 8192, 4096>(x, value_z_weight, value, z, stream);
+        return;
+    }
+    throw std::invalid_argument("Q4/Q4 GDN independent geometry is not admitted");
 }
 
 } // namespace ninfer::ops::detail

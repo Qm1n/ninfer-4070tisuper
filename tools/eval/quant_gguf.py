@@ -163,7 +163,10 @@ def main():
     n_q = 0
     # pass 1: register tensor infos (must happen in NO_FILE state)
     raw_tensors = {}
+    f32_tensors = set()
     for t in reader.tensors:
+        if t.tensor_type == gguf.GGMLQuantizationType.F32:
+            f32_tensors.add(t.name)
         if t.tensor_type not in (gguf.GGMLQuantizationType.BF16, gguf.GGMLQuantizationType.F32):
             # small control tensors stored packed (Q8_0 etc.): copy verbatim
             raw_bytes = np.array(t.data, copy=True)
@@ -173,8 +176,13 @@ def main():
             raw_tensors[t.name] = raw_bytes
             continue
         shape = tuple(int(d) for d in reversed(t.shape))
-        writer.add_tensor_info(t.name, shape, np.dtype(np.uint16),
-                               int(np.prod(shape)) * 2, raw_dtype=gguf.GGMLQuantizationType.BF16)
+        if t.name in f32_tensors:
+            # GDN control tensors must stay F32 (CPU binary-op type mixing)
+            writer.add_tensor_info(t.name, shape, np.dtype(np.float32),
+                                   int(np.prod(shape)) * 4, raw_dtype=gguf.GGMLQuantizationType.F32)
+        else:
+            writer.add_tensor_info(t.name, shape, np.dtype(np.uint16),
+                                   int(np.prod(shape)) * 2, raw_dtype=gguf.GGMLQuantizationType.BF16)
     writer.write_header_to_file(path=args.out)
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
@@ -199,8 +207,11 @@ def main():
             else:
                 w = quant_dequant_axis(w, 1, qmin, qmax)
             n_q += 1
-        bf = torch.from_numpy(w).to(torch.bfloat16).numpy().view(np.uint16)
-        writer.write_tensor_data(bf)
+        if t.name in f32_tensors:
+            writer.write_tensor_data(w.astype(np.float32))
+        else:
+            bf = torch.from_numpy(w).to(torch.bfloat16).view(torch.uint16).numpy()
+            writer.write_tensor_data(bf)
 
     writer.close()
     print(f"[{args.layout}] quantized {n_q} tensors -> {args.out}")

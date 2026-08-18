@@ -125,8 +125,13 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
+    if (q.ne[1] == Gqa27Geometry::QHeads && cache.num_kv_heads == Gqa27Geometry::KVHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
+                                                                 metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] == Gqa9BGeometry::QHeads && cache.num_kv_heads == Gqa9BGeometry::KVHeads) {
+        gqa_attention_prompt_attention_launch_for<Gqa9BGeometry>(q, positions, scale, cache,
                                                                  metadata, out, stream);
         return;
     }
@@ -140,6 +145,10 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (k.ne[1] == Gqa27Geometry::KVHeads) {
         gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
+        return;
+    }
+    if (k.ne[1] == Gqa9BGeometry::KVHeads) {
+        gqa_kv_append_launch_for<Gqa9BGeometry>(k, v, positions, cache, metadata, stream);
         return;
     }
     gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
@@ -157,9 +166,15 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
-        if (q.ne[1] == Gqa27Geometry::QHeads) {
+        if (q.ne[1] == Gqa27Geometry::QHeads && cache.num_kv_heads == Gqa27Geometry::KVHeads) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+            return;
+        }
+        if (q.ne[1] == Gqa9BGeometry::QHeads && cache.num_kv_heads == Gqa9BGeometry::KVHeads) {
+            gqa_kv_append_launch_for<Gqa9BGeometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Gqa9BGeometry>(q, positions, scale, cache,
                                                                      metadata, out, stream);
             return;
         }

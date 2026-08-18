@@ -52,6 +52,32 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    case 4096:
+        switch (n) {
+        case 18432: // Qwen3.5-9B MTP attention query/key/gate/value
+            if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        case 24576: // Qwen3.5-9B MLP gate/up (materialized swiglu fallback)
+        case 248320: // Qwen3.5-9B full output head
+        case 131072: // Qwen3.5-9B optimized draft head
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
+    case 8192:
+        if (n == 4096) { // Qwen3.5-9B MTP input projection
+            if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     case 2048:
         if (n == 131072) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
