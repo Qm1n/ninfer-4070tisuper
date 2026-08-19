@@ -335,3 +335,29 @@ Codex findings (full report: CONTEXT-128K-REVIEW.md):
 RANKED: 1) INT4-G64 KV (GO, 10-14 eng-days est), 2) graph allowance calibration,
 3) host GDN rewrite checkpoint (MTP phase), 4) chunk 64, 5) G128 conditional,
 6-8) NO-GO (scale codec, KV offload, hot-state offload).
+
+## 15. INT4-G64 KV SHIPPED — 128K CONTEXT ACHIEVED (2026-08-19)
+
+Implementation (codex, qualified on GPU by me): PagedKVEncoding{Bf16,I8G64,I4G64} threaded
+through paged_kv_cache/decoder_state/layouts_impl/gqa wrappers; kernels = Q8-G64 on-chip +
+packed K4/V4 loads unpacked to smem (QK stays mma_s8, V to bf16); CLI --kv-dtype i4.
+Codec bit-exact vs oracle (verify_exact on code+scale planes pass); output criterion
+calibrated to i4 envelope (18x coarser codes; worst observed deviation 0.58%, criterion
+10x i8 profile with derivation comment). llm anchor: q4_0-KV PPL +0.003 @4k.
+
+MEASURED (minq4 + pinned-embed):
+| mode | kv | max ctx | decode | note |
+|---|---|---|---|---|
+| plain | int8 | 73,728 | 12.8 @32k | old |
+| plain | i4 | **131,072** | **12.6 @131k** | speed FLAT vs 32k (unpack ~1%) |
+| MTP3 | int8 | 49,152 | 25.7 | acceptance 64.3% |
+| MTP3 | i4 | ~90,112* | 21.3 | acceptance drops 64->48% -> speed loss; prefer int8 |
+(*114,688 fails reservation; 98,304 passes check but hits late cudaMalloc in w8_small_t —
+ reservation underestimates MTP workspace, pre-existing issue.)
+
+RECOMMENDED CONFIGS:
+- Max window:  --kv-dtype i4 --max-context 131072 --prefill-chunk 384        (12.6 tok/s)
+- Max speed:   --kv-dtype int8 --max-context 49152 --spec mtp --draft-tokens 3 (25.7 tok/s)
+
+Remaining 128k-MTP3 path (if ever needed): host GDN rewrite checkpoint (-147 MiB) +
+graph-allowance calibration (-82) + G128 (-68) per codex review; acceptance risk remains.
