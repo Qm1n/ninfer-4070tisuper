@@ -311,3 +311,27 @@ REMAINING IDEAS, honestly ranked (none are big):
 3. sm_86 lacks PDL; launch-overlap inside decode rounds is already amortized by CUDA graphs.
 4. KV reads at large ctx are irreducible on-device (paged int8 already).
 Everything else = hardware.
+
+## 14. 128K CONTEXT PLAN (codex review + quality gate, 2026-08-19)
+
+Quality gate (llama.cpp anchor, IQ3_XXS weights, 4k ctx, 6 chunks):
+int8 KV PPL 5.8886 vs q4_0 KV PPL 5.8919 → +0.003. 4-bit KV is quality-free here.
+
+Codex findings (full report: CONTEXT-128K-REVIEW.md):
+- Geometry correction: 4 KV heads x 256 dim (not 8x128). INT4-G64 KV = 17,408 B/tok
+  → 2.125 GiB at 131,072. PLAIN 128k fits with ~273-282 MiB margin (2.92 avail).
+- MTP3 128k: short ~290 MiB after INT4; recoverable in theory via host-resident GDN
+  rewrite checkpoint (-147 MiB, decode-neutral) + chunk 64 (-11) + graph-allowance
+  calibration (-82) + G128 (-68) → ~18 MiB margin. Separate phase.
+- Kernel route: Q8 x unpacked-K4 — keep mma.sync s8 QK path, unpack K nibbles to smem,
+  V nibbles to bf16 smem; DRAM KV traffic halves → decode at long ctx IMPROVES.
+  Do NOT add DType::I4 (element sizing assumes integral); use PagedKVEncoding enum
+  + U8 code planes [128,64,heads,pages] + fp16 scales [4,64,heads,pages].
+- GDN state: 2 slots x 146.8 MiB/lane (current + rewrite checkpoint) — checkpoint is
+  the host-offload candidate; hot slot stays device (288 MiB/token PCIe if moved).
+- KV host offload: definitively NO-GO (6.1 tok/s ceiling at 128k over PCIe).
+- 131,072 = 2,048 pages x 64: zero rounding waste.
+
+RANKED: 1) INT4-G64 KV (GO, 10-14 eng-days est), 2) graph allowance calibration,
+3) host GDN rewrite checkpoint (MTP phase), 4) chunk 64, 5) G128 conditional,
+6-8) NO-GO (scale codec, KV offload, hot-state offload).
