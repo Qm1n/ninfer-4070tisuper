@@ -13,6 +13,7 @@
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -42,6 +43,8 @@ inline constexpr int kGqaPrefillI8SmemBytes = kGqaPrefillI8QBytes + kGqaPrefillI
                                               kGqaPrefillI8KBytes + kGqaPrefillI8VBytes +
                                               kGqaPrefillI8VStageBytes + kGqaPrefillI8PBytes +
                                               kGqaPrefillI8ScaleBytes + kGqaPrefillI8StatsBytes;
+// Fork: K4/V4 packed staging plus unpacked K8/BF16 V retains the same shared-memory ceiling.
+inline constexpr int kGqaPrefillI4SmemBytes = kGqaPrefillI8SmemBytes;
 
 static_assert(kGqaPrefillI8Groups == 4);
 static_assert(kGqaPrefillI8DConsumers == 4);
@@ -142,6 +145,68 @@ __launch_bounds__(256) __global__
     }
 }
 
+// Fork: exact signed-nibble append codec; one lane emits one adjacent-value code byte.
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__
+    void gqa_attention_prefill_fill_i4_kernel(const __nv_bfloat16* __restrict__ k,
+                                              const __nv_bfloat16* __restrict__ v,
+                                              const std::int32_t* __restrict__ positions,
+                                              Metadata metadata,
+                                              std::uint8_t* __restrict__ cache_k,
+                                              std::uint8_t* __restrict__ cache_v,
+                                              __half* __restrict__ scale_k,
+                                              __half* __restrict__ scale_v, std::int32_t width) {
+    constexpr int Warps         = 8;
+    constexpr unsigned FullMask = 0xffffffffu;
+    const int tokens            = metadata.valid_tokens(width);
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
+    const int units             = tokens * Geometry::KVHeads * kGqaPrefillI8Groups;
+    if (unit >= units) { return; }
+
+    const int group                 = unit % kGqaPrefillI8Groups;
+    const int tmp                   = unit / kGqaPrefillI8Groups;
+    const int kv_head               = tmp % Geometry::KVHeads;
+    const int token                 = tmp / Geometry::KVHeads;
+    const int position              = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    const int page_off              = position & kPagedKVPageMask;
+    const int d0                    = group * kGqaKvQuantGroup + 2 * lane;
+    const int d1                    = d0 + 1;
+
+    const std::int64_t src0 = gqa_kv_quant_src_index<Geometry>(kv_head, d0, token);
+    const std::int64_t src1 = gqa_kv_quant_src_index<Geometry>(kv_head, d1, token);
+    const float k0          = __bfloat162float(k[src0]);
+    const float k1          = __bfloat162float(k[src1]);
+    const float v0          = __bfloat162float(v[src0]);
+    const float v1          = __bfloat162float(v[src1]);
+
+    const float k_abs = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
+    const float v_abs = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
+    const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / 7.0f : 0.0f);
+    const __half vsh  = __float2half_rn(v_abs > 0.0f ? v_abs / 7.0f : 0.0f);
+    const float ks    = __half2float(ksh);
+    const float vs    = __half2float(vsh);
+    const float kinv  = ks > 0.0f ? 1.0f / ks : 0.0f;
+    const float vinv  = vs > 0.0f ? 1.0f / vs : 0.0f;
+    page              = __shfl_sync(FullMask, page, 0);
+
+    const std::int64_t code_base =
+        gqa_kv_quant_i4_code_index<Geometry>(page, kv_head, group * 32, page_off);
+    cache_k[code_base + lane] =
+        gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(k0, kinv), gqa_kv_quant_i4_code(k1, kinv));
+    cache_v[code_base + lane] =
+        gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(v0, vinv), gqa_kv_quant_i4_code(v1, vinv));
+    if (lane == 0) {
+        const std::int64_t scale_off =
+            gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
+        scale_k[scale_off] = ksh;
+        scale_v[scale_off] = vsh;
+    }
+}
+
 // Large appends are scheduled in absolute eight-token tiles. Eight divides P=64, so each CTA is
 // page-local while an unknown base offset costs at most one empty tail CTA in the launch envelope.
 template <typename Geometry, typename Metadata>
@@ -211,10 +276,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     }
 }
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, typename CacheCode>
 __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
-    const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
-    const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
+    const __nv_bfloat16* __restrict__ q, const CacheCode* __restrict__ cache_k,
+    const CacheCode* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
@@ -232,19 +297,30 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     constexpr int WorkerThreads = VWorkerWarps * 32;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
+    // Fork: unsigned code elements select native packed signed-nibble storage.
+    constexpr bool I4 = std::is_same_v<CacheCode, std::uint8_t>;
+    using PvType      = std::conditional_t<I4, __nv_bfloat16, __half>;
 
     static_assert(GroupKc == 2);
     static_assert(PVNtPerWarp == 8);
+    static_assert(I4 || std::is_same_v<CacheCode, std::int8_t>);
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::int8_t* q_i8 = reinterpret_cast<std::int8_t*>(smem_raw);
     float* q_scale    = reinterpret_cast<float*>(q_i8 + kGqaPrefillI8QBytes);
-    std::int8_t* k_i8 = reinterpret_cast<std::int8_t*>(reinterpret_cast<unsigned char*>(q_scale) +
-                                                       kGqaPrefillI8QScaleBytes);
-    std::int8_t* v_i8 = k_i8 + kGqaPrefillI8KBytes;
-    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + kGqaPrefillI8VBytes);
-    __half* p_s       = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) +
-                                                  kGqaPrefillI8VStageBytes);
+    unsigned char* code_stage = reinterpret_cast<unsigned char*>(q_scale) +
+                                kGqaPrefillI8QScaleBytes;
+    constexpr int PackedBytes = I4 ? kGqaPrefillI8KBytes / 2 : kGqaPrefillI8KBytes;
+    auto* k_codes             = reinterpret_cast<CacheCode*>(code_stage);
+    auto* v_codes             = reinterpret_cast<CacheCode*>(code_stage + PackedBytes);
+    // Fork: I4 unpacks K after its two packed code planes; I8 already is the MMA tile.
+    std::int8_t* k_i8 = I4 ? reinterpret_cast<std::int8_t*>(code_stage + 2 * PackedBytes)
+                           : reinterpret_cast<std::int8_t*>(k_codes);
+    auto* v_i8        = I4 ? nullptr : reinterpret_cast<std::int8_t*>(v_codes);
+    PvType* v_stage = I4 ? reinterpret_cast<PvType*>(k_i8 + kGqaPrefillI8KBytes)
+                         : reinterpret_cast<PvType*>(v_i8 + kGqaPrefillI8VBytes);
+    PvType* p_s = reinterpret_cast<PvType*>(reinterpret_cast<unsigned char*>(v_stage) +
+                                            kGqaPrefillI8VStageBytes);
     __half* k_scale_s =
         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kGqaPrefillI8PBytes);
     __half* v_scale_s    = k_scale_s + Bc * Groups;
@@ -313,21 +389,36 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             }
         }
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 16); chunk += kGqaPrefillI8Threads) {
-            const int key_l = chunk / (D / 16);
-            const int dc    = chunk - key_l * (D / 16);
-            const int d     = dc * 16;
-            const int key   = tile_k0 + key_l;
-            std::int8_t* kd = &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
-            std::int8_t* vd = &v_i8[key_l * D + d];
+        // Fork: I4 loads 32 dimensions per 16-byte transaction, halving code-plane traffic.
+        for (int chunk = tid; chunk < Bc * (D / (I4 ? 32 : 16));
+             chunk += kGqaPrefillI8Threads) {
+            constexpr int DimsPerLoad = I4 ? 32 : 16;
+            const int key_l           = chunk / (D / DimsPerLoad);
+            const int dc              = chunk - key_l * (D / DimsPerLoad);
+            const int d               = dc * DimsPerLoad;
+            const int key             = tile_k0 + key_l;
             if (key <= max_query_abs) {
-                const std::int64_t off =
-                    gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
-                cp_async<16, Cache::cg>(kd, &cache_k[off]);
-                cp_async<16, Cache::cg>(vd, &cache_v[off]);
+                if constexpr (I4) {
+                    const std::int64_t off = gqa_kv_quant_i4_code_index<Geometry>(
+                        physical_page, kv_head, d / 2, key_l);
+                    cp_async<16, Cache::cg>(&k_codes[key_l * D / 2 + d / 2], &cache_k[off]);
+                    cp_async<16, Cache::cg>(&v_codes[key_l * D / 2 + d / 2], &cache_v[off]);
+                } else {
+                    const std::int64_t off =
+                        gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
+                    std::int8_t* kd =
+                        &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
+                    cp_async<16, Cache::cg>(kd, &cache_k[off]);
+                    cp_async<16, Cache::cg>(&v_i8[key_l * D + d], &cache_v[off]);
+                }
+            } else if constexpr (I4) {
+                store_vec(&k_codes[key_l * D / 2 + d / 2], make_int4(0, 0, 0, 0));
+                store_vec(&v_codes[key_l * D / 2 + d / 2], make_int4(0, 0, 0, 0));
             } else {
+                std::int8_t* kd =
+                    &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
                 store_vec(kd, make_int4(0, 0, 0, 0));
-                store_vec(vd, make_int4(0, 0, 0, 0));
+                store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
             }
         }
         ninfer::ops::cp_commit();
@@ -375,6 +466,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const float scale_l2 = scale * Log2E;
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
+        // Fork: cooperatively unpack K4 before QK; V4 remains overlapped with QK below.
+        if constexpr (I4) {
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 8); chunk += kGqaPrefillI8Threads) {
+                const int key_l = chunk / (D / 8);
+                const int dc    = chunk - key_l * (D / 8);
+                const int d     = dc * 8;
+                std::int8_t* kd =
+                    &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 4)) * 2];
+                store_vec(kd, gqa_kv_unpack_i4x8_to_i8(&k_codes[key_l * D / 2 + d / 2]));
+            }
+            __syncthreads();
+        }
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
             float score[QKNt][4];
@@ -493,10 +597,17 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)] = __float2half_rn(p00);
-                p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col1)] = __float2half_rn(p01);
-                p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)] = __float2half_rn(p10);
-                p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col1)] = __float2half_rn(p11);
+                if constexpr (I4) {
+                    p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)] = __float2bfloat16(p00);
+                    p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col1)] = __float2bfloat16(p01);
+                    p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)] = __float2bfloat16(p10);
+                    p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col1)] = __float2bfloat16(p11);
+                } else {
+                    p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)] = __float2half_rn(p00);
+                    p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col1)] = __float2half_rn(p01);
+                    p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)] = __float2half_rn(p10);
+                    p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col1)] = __float2half_rn(p11);
+                }
             }
             bl0        = warp_sum<4>(bl0, FullMask);
             bl1        = warp_sum<4>(bl1, FullMask);
@@ -508,23 +619,33 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
-        } else if (warp < ProducerWarps + VWorkerWarps) {
-            const int worker_tid = tid - ProducerWarps * 32;
+        } else {
+            if (warp < ProducerWarps + VWorkerWarps) {
+                const int worker_tid = tid - ProducerWarps * 32;
 #pragma unroll 1
-            for (int chunk = worker_tid; chunk < Bc * (D / 8); chunk += WorkerThreads) {
-                const int key_l = chunk / (D / 8);
-                const int dc    = chunk - key_l * (D / 8);
-                const int d     = dc * 8;
-                const int key   = k0 + key_l;
-                __half* dst     = &v_f16[key_l * D + gqa_prefill_swz(key_l, d)];
-                if (key <= max_query_abs) {
-                    const int grp = d >> 6;
-                    __half vs     = __float2half_rn(0.0f);
-                    if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
-                    vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, gqa_prefill_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
-                } else {
-                    store_vec(dst, make_int4(0, 0, 0, 0));
+                for (int chunk = worker_tid; chunk < Bc * (D / 8); chunk += WorkerThreads) {
+                    const int key_l = chunk / (D / 8);
+                    const int dc    = chunk - key_l * (D / 8);
+                    const int d     = dc * 8;
+                    const int key   = k0 + key_l;
+                    PvType* dst     = &v_stage[key_l * D + gqa_prefill_swz(key_l, d)];
+                    if (key <= max_query_abs) {
+                        const int grp = d >> 6;
+                        __half vs     = __float2half_rn(0.0f);
+                        if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
+                        vs = __shfl_sync(FullMask, vs, grp * 8);
+                        // Fork: consumer warps unpack V4 while producers execute QK.
+                        if constexpr (I4) {
+                            store_vec(dst, gqa_kv_dequant_i4x8_from(
+                                               &v_codes[key_l * D / 2 + d / 2],
+                                               __half2float(vs)));
+                        } else {
+                            store_vec(dst,
+                                      gqa_prefill_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                        }
+                    } else {
+                        store_vec(dst, make_int4(0, 0, 0, 0));
+                    }
                 }
             }
         }
@@ -560,9 +681,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
-                              smem_addr(&v_f16[vrow * D + gqa_prefill_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                              smem_addr(&v_stage[vrow * D + gqa_prefill_swz(vrow, vcol)]));
+                if constexpr (I4) {
+                    mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                             pf[3], vf[0], vf[1]);
+                } else {
+                    mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                            pf[3], vf[0], vf[1]);
+                }
             }
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }

@@ -30,8 +30,9 @@ drafts, fallback steps, timing, memory planning, and peak CUDA allocation.
 
 Important runtime controls include:
 
+<!-- // Fork: the diagnostic reference mirrors native packed I4-G64 storage. -->
 - `--gpu-memory auto|24GiB` and `--headroom 2GiB`;
-- `--kv-dtype bf16|int8`;
+- `--kv-dtype bf16|int8|i4`;
 - `--prefill-chunk N`;
 - `--greedy` or sampling overrides for temperature, top-p, top-k, and penalties;
 - `--vision-attention-limit N`;

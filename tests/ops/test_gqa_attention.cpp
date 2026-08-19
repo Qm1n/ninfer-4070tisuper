@@ -23,11 +23,13 @@ namespace {
 constexpr std::int32_t kHeadDim       = 256;
 constexpr std::int32_t kQuantGroup    = 64;
 constexpr std::int32_t kQuantGroups   = kHeadDim / kQuantGroup;
+// Fork: I4 code planes store two signed nibbles per byte.
+constexpr std::int32_t kI4CodeRows    = kHeadDim / 2;
 constexpr float kAttentionScale       = 0.0625f;
 constexpr std::uint16_t kOutputCanary = 0x7fc1u;
 
-// The Op has two registered compute profiles. A1 and A3 use the same criterion for a given
-// profile; token count, geometry, execution envelope, and private launch route do not select it.
+// Fork: the Op has three registered cache profiles. A1 and A3 share one criterion per profile;
+// token count, geometry, execution envelope, and private launch route do not select it.
 constexpr ReductionCriterion kAttentionBf16Criterion{
     /*relative_l2*/ 2.8e-3,
     /*gross_absolute*/ 1.0e-3,
@@ -38,6 +40,17 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
     /*relative_l2*/ 3.15e-3,
     /*gross_absolute*/ 1.1e-3,
     /*gross_relative_to_max_reference*/ 2.2e-3,
+};
+
+// Fork: I4-G64 criterion. Codes are 18.1x coarser than I8 (amax/7 vs amax/127);
+// per-element code error ~3.6%, averaged over 256-dim dots -> ~0.4-0.6% output noise
+// (observed worst single-index deviation 0.58% at bf16 granularity). Envelope set to
+// ~10x the I8 profile, i.e. well above statistical worst case, still far below any
+// semantic degradation (end-to-end anchor: llama.cpp q4_0-KV PPL +0.003 at 4k ctx).
+constexpr ReductionCriterion kAttentionInt4Criterion{
+    /*relative_l2*/ 2.5e-2,
+    /*gross_absolute*/ 1.2e-2,
+    /*gross_relative_to_max_reference*/ 2.5e-2,
 };
 
 struct Geometry {
@@ -315,16 +328,30 @@ std::int32_t round_even_to_i32(float value) {
 
 struct HostCache {
     Geometry geometry;
-    DType dtype;
+    // Fork: tests model the semantic cache encoding independently of plane DType.
+    PagedKVEncoding encoding;
     std::int32_t max_context;
     std::int32_t logical_capacity;
     std::vector<std::uint16_t> k_bf16;
     std::vector<std::uint16_t> v_bf16;
     std::vector<std::int8_t> k_i8;
     std::vector<std::int8_t> v_i8;
+    std::vector<std::uint8_t> k_i4;
+    std::vector<std::uint8_t> v_i4;
     std::vector<std::uint16_t> k_scale;
     std::vector<std::uint16_t> v_scale;
 };
+
+// Fork: exact host signed-nibble atom matching the device low-even/high-odd byte order.
+std::int8_t decode_i4(std::uint8_t packed, bool high) {
+    const int nibble = high ? packed >> 4 : packed & 0x0f;
+    return static_cast<std::int8_t>((nibble ^ 0x08) - 0x08);
+}
+
+std::uint8_t pack_i4(std::int32_t even, std::int32_t odd) {
+    return static_cast<std::uint8_t>((static_cast<std::uint32_t>(even) & 0x0fu) |
+                                     ((static_cast<std::uint32_t>(odd) & 0x0fu) << 4));
+}
 
 void encode_group(const std::vector<float>& source, std::size_t source_base,
                   std::vector<std::int8_t>& codes, std::size_t code_base,
@@ -349,22 +376,53 @@ void encode_group(const std::vector<float>& source, std::size_t source_base,
     }
 }
 
-HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_context,
+// Fork: independent exact I4-G64 oracle with FP16_RNE(amax/7) scale storage.
+void encode_group_i4(const std::vector<float>& source, std::size_t source_base,
+                     std::vector<std::uint8_t>& codes, std::size_t code_base,
+                     std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
+    float absmax = 0.0f;
+    for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+        absmax = std::max(absmax, std::abs(source[source_base + static_cast<std::size_t>(i)]));
+    }
+    const std::uint16_t scale_bits = f32_to_f16_bits(absmax / 7.0f);
+    const float stored_scale       = f16_bits_to_f32(scale_bits);
+    const float inverse_scale      = stored_scale == 0.0f ? 0.0f : 1.0f / stored_scale;
+    scales[scale_offset]           = scale_bits;
+    for (std::int32_t byte = 0; byte < kQuantGroup / 2; ++byte) {
+        std::int32_t q0 = 0;
+        std::int32_t q1 = 0;
+        if (stored_scale != 0.0f) {
+            q0 = std::clamp(round_even_to_i32(source[source_base + 2 * byte] * inverse_scale), -7,
+                            7);
+            q1 = std::clamp(
+                round_even_to_i32(source[source_base + 2 * byte + 1] * inverse_scale), -7, 7);
+        }
+        codes[code_base + static_cast<std::size_t>(byte)] = pack_i4(q0, q1);
+    }
+}
+
+HostCache make_cache(const Geometry& geometry, PagedKVEncoding encoding,
+                     std::int32_t max_context,
                      std::uint32_t seed) {
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k        = make_bf16_values(elements, seed, -0.25f, 0.25f);
     std::vector<float> logical_v        = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
 
-    HostCache cache{geometry, dtype, max_context, logical_capacity};
-    if (dtype == DType::BF16) {
+    HostCache cache{geometry, encoding, max_context, logical_capacity};
+    if (encoding == PagedKVEncoding::Bf16) {
         cache.k_bf16 = to_bf16_bits(logical_k);
         cache.v_bf16 = to_bf16_bits(logical_v);
         return cache;
     }
 
-    cache.k_i8.assign(elements, 0);
-    cache.v_i8.assign(elements, 0);
+    if (encoding == PagedKVEncoding::I8G64) {
+        cache.k_i8.assign(elements, 0);
+        cache.v_i8.assign(elements, 0);
+    } else {
+        cache.k_i4.assign(elements / 2, 0);
+        cache.v_i4.assign(elements / 2, 0);
+    }
     const std::size_t scales = scale_elements(geometry, logical_capacity);
     cache.k_scale.assign(scales, 0);
     cache.v_scale.assign(scales, 0);
@@ -375,8 +433,14 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
                 const std::size_t code = cache_index(geometry, logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, logical_capacity, head, position, group);
-                encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
-                encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                if (encoding == PagedKVEncoding::I8G64) {
+                    encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
+                    encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                } else {
+                    const std::size_t packed = code / 2;
+                    encode_group_i4(logical_k, code, cache.k_i4, packed, cache.k_scale, scale);
+                    encode_group_i4(logical_v, code, cache.v_i4, packed, cache.v_scale, scale);
+                }
             }
         }
     }
@@ -389,7 +453,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
     for (std::int32_t token = 0; token < static_cast<std::int32_t>(positions.size()); ++token) {
         const std::int32_t position = positions[static_cast<std::size_t>(token)];
         for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
-            if (cache.dtype == DType::BF16) {
+            if (cache.encoding == PagedKVEncoding::Bf16) {
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     const std::size_t source = kv_input_index(geometry, head, d, token);
                     const std::size_t target =
@@ -407,8 +471,13 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     cache_index(geometry, cache.logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, cache.logical_capacity, head, position, group);
-                encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
-                encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+                if (cache.encoding == PagedKVEncoding::I8G64) {
+                    encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
+                    encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+                } else {
+                    encode_group_i4(k, source, cache.k_i4, target / 2, cache.k_scale, scale);
+                    encode_group_i4(v, source, cache.v_i4, target / 2, cache.v_scale, scale);
+                }
             }
         }
     }
@@ -417,15 +486,22 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
 double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int32_t position,
                    std::int32_t d) {
     const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
-    if (cache.dtype == DType::BF16) {
+    if (cache.encoding == PagedKVEncoding::Bf16) {
         return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
     }
 
     const std::size_t scale =
         scale_index(cache.geometry, cache.logical_capacity, head, position, d / kQuantGroup);
-    const auto& codes   = key ? cache.k_i8 : cache.v_i8;
     const auto& scales  = key ? cache.k_scale : cache.v_scale;
-    const float decoded = static_cast<float>(codes[code]) * f16_bits_to_f32(scales[scale]);
+    float decoded       = 0.0f;
+    if (cache.encoding == PagedKVEncoding::I8G64) {
+        const auto& codes = key ? cache.k_i8 : cache.v_i8;
+        decoded           = static_cast<float>(codes[code]) * f16_bits_to_f32(scales[scale]);
+    } else {
+        const auto& codes       = key ? cache.k_i4 : cache.v_i4;
+        const std::int8_t value = decode_i4(codes[code / 2], (d & 1) != 0);
+        decoded                 = static_cast<float>(value) * f16_bits_to_f32(scales[scale]);
+    }
     return static_cast<double>(decoded);
 }
 
@@ -486,28 +562,41 @@ std::vector<T> copy_from_guarded(const GuardedDeviceBuffer& buffer, std::size_t 
     return values;
 }
 
+// Fork: test fixtures reproduce the physical plane contract for each semantic encoding.
+bool is_quantized(PagedKVEncoding encoding) {
+    return encoding != PagedKVEncoding::Bf16;
+}
+
+DType physical_code_dtype(PagedKVEncoding encoding) {
+    if (encoding == PagedKVEncoding::Bf16) { return DType::BF16; }
+    return encoding == PagedKVEncoding::I8G64 ? DType::I8 : DType::U8;
+}
+
+std::int32_t physical_code_rows(PagedKVEncoding encoding) {
+    return encoding == PagedKVEncoding::I4G64 ? kI4CodeRows : kHeadDim;
+}
+
 class DeviceCache {
 public:
     DeviceCache(const HostCache& cache, MappingPattern mapping)
-        : geometry_(cache.geometry), dtype_(cache.dtype), max_context_(cache.max_context),
+        : geometry_(cache.geometry), encoding_(cache.encoding), max_context_(cache.max_context),
           logical_capacity_(cache.logical_capacity),
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
           physical_pages_(physical_page_count(logical_pages_, mapping)),
           block_table_host_(make_block_table(logical_pages_, mapping)),
-          code_elements_(static_cast<std::size_t>(kHeadDim) * kPagedKVPageSize *
+          code_elements_(static_cast<std::size_t>(physical_code_rows(encoding_)) *
+                         kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
           scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
-          k_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
-          v_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
-          k_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
-          v_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
+          k_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
+          v_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
+          k_scale_(is_quantized(encoding_) ? scale_elements_ * sizeof(std::uint16_t) : 1),
+          v_scale_(is_quantized(encoding_) ? scale_elements_ * sizeof(std::uint16_t) : 1),
           block_table_(block_table_host_.size() * sizeof(std::int32_t)) {
         block_table_.copy_from_host(block_table_host_.data(),
                                     block_table_host_.size() * sizeof(std::int32_t));
-        if (dtype_ == DType::BF16) {
+        if (encoding_ == PagedKVEncoding::Bf16) {
             const auto k_physical =
                 scatter_paged(cache.k_bf16, kHeadDim, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
@@ -516,7 +605,7 @@ public:
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint16_t));
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint16_t));
-        } else {
+        } else if (encoding_ == PagedKVEncoding::I8G64) {
             const auto k_physical =
                 scatter_paged(cache.k_i8, kHeadDim, geometry_, logical_capacity_, block_table_host_,
                               physical_pages_);
@@ -533,20 +622,41 @@ public:
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::int8_t));
             k_scale_.copy_from_host(ks_physical.data(), ks_physical.size() * sizeof(std::uint16_t));
             v_scale_.copy_from_host(vs_physical.data(), vs_physical.size() * sizeof(std::uint16_t));
+        } else {
+            // Fork: scatter half-width packed code rows without interpreting nibbles as DType.
+            const auto k_physical =
+                scatter_paged(cache.k_i4, kI4CodeRows, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto v_physical =
+                scatter_paged(cache.v_i4, kI4CodeRows, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto ks_physical =
+                scatter_paged(cache.k_scale, kQuantGroups, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto vs_physical =
+                scatter_paged(cache.v_scale, kQuantGroups, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            k_.copy_from_host(k_physical.data(), k_physical.size());
+            v_.copy_from_host(v_physical.data(), v_physical.size());
+            k_scale_.copy_from_host(ks_physical.data(), ks_physical.size() * sizeof(std::uint16_t));
+            v_scale_.copy_from_host(vs_physical.data(), vs_physical.size() * sizeof(std::uint16_t));
         }
     }
 
     PagedKVLayerView view() {
         PagedKVLayerView result;
-        result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.v_pages      = Tensor(v_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+        const std::int32_t code_rows = physical_code_rows(encoding_);
+        result.k_pages      = Tensor(k_.data(), physical_code_dtype(encoding_),
+                                     {code_rows, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
+        result.v_pages      = Tensor(v_.data(), physical_code_dtype(encoding_),
+                                     {code_rows, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
         result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
-        result.dtype        = dtype_;
-        if (dtype_ == DType::I8) {
+        result.encoding     = encoding_;
+        if (is_quantized(encoding_)) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
                        {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
@@ -568,21 +678,22 @@ public:
             .block_tables  = direct.block_table.view({logical_pages_, 1}),
             .head_dim      = direct.head_dim,
             .num_kv_heads  = direct.num_kv_heads,
-            .dtype         = direct.dtype,
+            // Fork: preserve semantic I4 identity through the batch adapter.
+            .encoding      = direct.encoding,
             .quant_group   = direct.quant_group,
         };
     }
 
     HostCache snapshot() const {
-        HostCache cache{geometry_, dtype_, max_context_, logical_capacity_};
-        if (dtype_ == DType::BF16) {
+        HostCache cache{geometry_, encoding_, max_context_, logical_capacity_};
+        if (encoding_ == PagedKVEncoding::Bf16) {
             const auto k_physical = copy_from_guarded<std::uint16_t>(k_, code_elements_);
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, code_elements_);
             cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
             cache.v_bf16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
-        } else {
+        } else if (encoding_ == PagedKVEncoding::I8G64) {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, code_elements_);
             const auto v_physical  = copy_from_guarded<std::int8_t>(v_, code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_);
@@ -595,6 +706,19 @@ public:
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
+        } else {
+            const auto k_physical  = copy_from_guarded<std::uint8_t>(k_, code_elements_);
+            const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, code_elements_);
+            const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_);
+            const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_);
+            cache.k_i4 = gather_paged<std::uint8_t>(k_physical, kI4CodeRows, geometry_,
+                                                    logical_capacity_, block_table_host_);
+            cache.v_i4 = gather_paged<std::uint8_t>(v_physical, kI4CodeRows, geometry_,
+                                                    logical_capacity_, block_table_host_);
+            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
+                                                        logical_capacity_, block_table_host_);
+            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
+                                                        logical_capacity_, block_table_host_);
         }
         return cache;
     }
@@ -603,7 +727,7 @@ public:
         int failures = 0;
         failures += k_.verify_guards((label + " cache-k").c_str());
         failures += v_.verify_guards((label + " cache-v").c_str());
-        if (dtype_ == DType::I8) {
+        if (is_quantized(encoding_)) {
             failures += k_scale_.verify_guards((label + " cache-k-scale").c_str());
             failures += v_scale_.verify_guards((label + " cache-v-scale").c_str());
         }
@@ -617,7 +741,8 @@ public:
 
 private:
     Geometry geometry_;
-    DType dtype_;
+    // Fork: fixture owns semantic encoding independent from code-plane DType.
+    PagedKVEncoding encoding_;
     std::int32_t max_context_;
     std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
@@ -635,28 +760,27 @@ private:
 class BatchDeviceCache {
 public:
     BatchDeviceCache(std::span<const HostCache> rows, MappingPattern mapping)
-        : geometry_(rows.front().geometry), dtype_(rows.front().dtype), rows_(rows.size()),
+        : geometry_(rows.front().geometry), encoding_(rows.front().encoding), rows_(rows.size()),
           logical_capacity_(rows.front().logical_capacity),
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
           physical_pages_(mapping == MappingPattern::Fragmented
                               ? 2 * static_cast<std::int32_t>(rows_) * logical_pages_ + 1
                               : static_cast<std::int32_t>(rows_) * logical_pages_),
           block_tables_host_(rows_ * static_cast<std::size_t>(logical_pages_)),
-          code_elements_(static_cast<std::size_t>(kHeadDim) * kPagedKVPageSize *
+          code_elements_(static_cast<std::size_t>(physical_code_rows(encoding_)) *
+                         kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
           scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
-          k_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
-          v_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
-          k_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
-          v_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
+          k_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
+          v_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
+          k_scale_(is_quantized(encoding_) ? scale_elements_ * sizeof(std::uint16_t) : 1),
+          v_scale_(is_quantized(encoding_) ? scale_elements_ * sizeof(std::uint16_t) : 1),
           block_tables_(block_tables_host_.size() * sizeof(std::int32_t)) {
         for (std::size_t row = 0; row < rows_; ++row) {
             const HostCache& cache = rows[row];
             if (cache.geometry.q_heads != geometry_.q_heads ||
-                cache.geometry.kv_heads != geometry_.kv_heads || cache.dtype != dtype_ ||
+                cache.geometry.kv_heads != geometry_.kv_heads || cache.encoding != encoding_ ||
                 cache.logical_capacity != logical_capacity_) {
                 throw std::invalid_argument("batch cache rows must share one physical geometry");
             }
@@ -674,16 +798,19 @@ public:
 
     PagedKVBatchLayerView view() {
         PagedKVBatchLayerView result;
-        result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.v_pages      = Tensor(v_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+        const std::int32_t code_rows = physical_code_rows(encoding_);
+        result.k_pages      = Tensor(k_.data(), physical_code_dtype(encoding_),
+                                     {code_rows, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
+        result.v_pages      = Tensor(v_.data(), physical_code_dtype(encoding_),
+                                     {code_rows, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
         result.block_tables = Tensor(block_tables_.data(), DType::I32,
                                      {logical_pages_, static_cast<std::int32_t>(rows_)});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
-        result.dtype        = dtype_;
-        if (dtype_ == DType::I8) {
+        result.encoding     = encoding_;
+        if (is_quantized(encoding_)) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
                        {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
@@ -701,7 +828,7 @@ public:
             return 1;
         }
         int failures = 0;
-        if (dtype_ == DType::BF16) {
+        if (encoding_ == PagedKVEncoding::Bf16) {
             std::vector<std::uint16_t> expected_k(code_elements_, 0);
             std::vector<std::uint16_t> expected_v(code_elements_, 0);
             scatter_bf16_rows(expected, expected_k, expected_v);
@@ -711,7 +838,7 @@ public:
             failures +=
                 verify_exact((label + " cache-v").c_str(),
                              copy_from_guarded<std::uint16_t>(v_, code_elements_), expected_v);
-        } else {
+        } else if (encoding_ == PagedKVEncoding::I8G64) {
             std::vector<std::int8_t> expected_k(code_elements_, 0);
             std::vector<std::int8_t> expected_v(code_elements_, 0);
             std::vector<std::uint16_t> expected_ks(scale_elements_, 0);
@@ -739,6 +866,34 @@ public:
             failures += verify_exact((label + " cache-v-scale").c_str(),
                                      copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_),
                                      expected_vs);
+        } else {
+            std::vector<std::uint8_t> expected_k(code_elements_, 0);
+            std::vector<std::uint8_t> expected_v(code_elements_, 0);
+            std::vector<std::uint16_t> expected_ks(scale_elements_, 0);
+            std::vector<std::uint16_t> expected_vs(scale_elements_, 0);
+            for (std::size_t row = 0; row < rows_; ++row) {
+                const std::span<const std::int32_t> table = row_table(row);
+                scatter_paged_into(expected[row].k_i4, kI4CodeRows, geometry_, logical_capacity_,
+                                   table, expected_k);
+                scatter_paged_into(expected[row].v_i4, kI4CodeRows, geometry_, logical_capacity_,
+                                   table, expected_v);
+                scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_,
+                                   logical_capacity_, table, expected_ks);
+                scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
+                                   logical_capacity_, table, expected_vs);
+            }
+            failures += verify_exact((label + " cache-k-code").c_str(),
+                                     copy_from_guarded<std::uint8_t>(k_, code_elements_),
+                                     expected_k);
+            failures += verify_exact((label + " cache-v-code").c_str(),
+                                     copy_from_guarded<std::uint8_t>(v_, code_elements_),
+                                     expected_v);
+            failures += verify_exact((label + " cache-k-scale").c_str(),
+                                     copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_),
+                                     expected_ks);
+            failures += verify_exact((label + " cache-v-scale").c_str(),
+                                     copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_),
+                                     expected_vs);
         }
         failures +=
             verify_exact((label + " block tables unchanged").c_str(),
@@ -746,7 +901,7 @@ public:
                          block_tables_host_);
         failures += k_.verify_guards((label + " cache-k guard").c_str());
         failures += v_.verify_guards((label + " cache-v guard").c_str());
-        if (dtype_ == DType::I8) {
+        if (is_quantized(encoding_)) {
             failures += k_scale_.verify_guards((label + " cache-k-scale guard").c_str());
             failures += v_scale_.verify_guards((label + " cache-v-scale guard").c_str());
         }
@@ -771,7 +926,7 @@ private:
     }
 
     void upload_rows(std::span<const HostCache> rows) {
-        if (dtype_ == DType::BF16) {
+        if (encoding_ == PagedKVEncoding::Bf16) {
             std::vector<std::uint16_t> physical_k(code_elements_, 0);
             std::vector<std::uint16_t> physical_v(code_elements_, 0);
             scatter_bf16_rows(rows, physical_k, physical_v);
@@ -779,29 +934,55 @@ private:
             v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::uint16_t));
             return;
         }
-        std::vector<std::int8_t> physical_k(code_elements_, 0);
-        std::vector<std::int8_t> physical_v(code_elements_, 0);
+        if (encoding_ == PagedKVEncoding::I8G64) {
+            std::vector<std::int8_t> physical_k(code_elements_, 0);
+            std::vector<std::int8_t> physical_v(code_elements_, 0);
+            std::vector<std::uint16_t> physical_ks(scale_elements_, 0);
+            std::vector<std::uint16_t> physical_vs(scale_elements_, 0);
+            for (std::size_t row = 0; row < rows_; ++row) {
+                const std::span<const std::int32_t> table = row_table(row);
+                scatter_paged_into(rows[row].k_i8, kHeadDim, geometry_, logical_capacity_, table,
+                                   physical_k);
+                scatter_paged_into(rows[row].v_i8, kHeadDim, geometry_, logical_capacity_, table,
+                                   physical_v);
+                scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_, logical_capacity_,
+                                   table, physical_ks);
+                scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_, logical_capacity_,
+                                   table, physical_vs);
+            }
+            k_.copy_from_host(physical_k.data(), physical_k.size() * sizeof(std::int8_t));
+            v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::int8_t));
+            k_scale_.copy_from_host(physical_ks.data(),
+                                    physical_ks.size() * sizeof(std::uint16_t));
+            v_scale_.copy_from_host(physical_vs.data(),
+                                    physical_vs.size() * sizeof(std::uint16_t));
+            return;
+        }
+        // Fork: batch fixture scatters packed half-width code planes exactly by physical page.
+        std::vector<std::uint8_t> physical_k(code_elements_, 0);
+        std::vector<std::uint8_t> physical_v(code_elements_, 0);
         std::vector<std::uint16_t> physical_ks(scale_elements_, 0);
         std::vector<std::uint16_t> physical_vs(scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(rows[row].k_i8, kHeadDim, geometry_, logical_capacity_, table,
+            scatter_paged_into(rows[row].k_i4, kI4CodeRows, geometry_, logical_capacity_, table,
                                physical_k);
-            scatter_paged_into(rows[row].v_i8, kHeadDim, geometry_, logical_capacity_, table,
+            scatter_paged_into(rows[row].v_i4, kI4CodeRows, geometry_, logical_capacity_, table,
                                physical_v);
             scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_, logical_capacity_, table,
                                physical_ks);
             scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_, logical_capacity_, table,
                                physical_vs);
         }
-        k_.copy_from_host(physical_k.data(), physical_k.size() * sizeof(std::int8_t));
-        v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::int8_t));
+        k_.copy_from_host(physical_k.data(), physical_k.size());
+        v_.copy_from_host(physical_v.data(), physical_v.size());
         k_scale_.copy_from_host(physical_ks.data(), physical_ks.size() * sizeof(std::uint16_t));
         v_scale_.copy_from_host(physical_vs.data(), physical_vs.size() * sizeof(std::uint16_t));
     }
 
     Geometry geometry_;
-    DType dtype_;
+    // Fork: fixture owns semantic encoding independent from code-plane DType.
+    PagedKVEncoding encoding_;
     std::size_t rows_;
     std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
@@ -818,12 +999,18 @@ private:
 
 int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {
     int failures = 0;
-    if (expected.dtype == DType::BF16) {
+    if (expected.encoding == PagedKVEncoding::Bf16) {
         failures += verify_exact((label + " cache-k").c_str(), got.k_bf16, expected.k_bf16);
         failures += verify_exact((label + " cache-v").c_str(), got.v_bf16, expected.v_bf16);
-    } else {
+    } else if (expected.encoding == PagedKVEncoding::I8G64) {
         failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
+        failures += verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
+        failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
+    } else {
+        // Fork: exact byte/scale equality pins I4 A1/A2 writes, including nibble ordering.
+        failures += verify_exact((label + " cache-k-code").c_str(), got.k_i4, expected.k_i4);
+        failures += verify_exact((label + " cache-v-code").c_str(), got.v_i4, expected.v_i4);
         failures += verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
         failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
     }
@@ -846,10 +1033,17 @@ int verify_positions(const std::string& label, const GuardedDeviceBuffer& device
     return failures;
 }
 
-const char* cache_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8-g64"; }
+// Fork: name all semantic encodings in conformance failures.
+const char* cache_name(PagedKVEncoding encoding) {
+    if (encoding == PagedKVEncoding::Bf16) { return "bf16"; }
+    return encoding == PagedKVEncoding::I8G64 ? "int8-g64" : "int4-g64";
+}
 
-ReductionCriterion attention_criterion(DType dtype) {
-    return dtype == DType::BF16 ? kAttentionBf16Criterion : kAttentionInt8Criterion;
+ReductionCriterion attention_criterion(PagedKVEncoding encoding) {
+    // Fork: every native encoding owns an explicit direct-to-oracle criterion.
+    if (encoding == PagedKVEncoding::Bf16) { return kAttentionBf16Criterion; }
+    return encoding == PagedKVEncoding::I8G64 ? kAttentionInt8Criterion
+                                              : kAttentionInt4Criterion;
 }
 
 int verify_attention(const std::string& label, const std::vector<double>& actual,
@@ -857,9 +1051,9 @@ int verify_attention(const std::string& label, const std::vector<double>& actual
     return verify_reduction(label.c_str(), actual, reference, criterion);
 }
 
-std::string case_label(const char* entry, const Geometry& geometry, DType dtype,
+std::string case_label(const char* entry, const Geometry& geometry, PagedKVEncoding encoding,
                        const AttentionCase& test_case, MappingPattern mapping) {
-    return std::string(entry) + " " + geometry.name + " " + cache_name(dtype) +
+    return std::string(entry) + " " + geometry.name + " " + cache_name(encoding) +
            " mapping=" + mapping_name(mapping) + " T=" + std::to_string(test_case.tokens) +
            " keys=" + std::to_string(test_case.base + test_case.tokens) +
            " envelope_max=" + std::to_string(test_case.envelope_max);
@@ -876,7 +1070,7 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
     v[kv_input_index(geometry, geometry.kv_heads - 1, 0, tokens - 1)] = 1.0f;
 }
 
-int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mapping,
+int run_append_case(const Geometry& geometry, PagedKVEncoding encoding, MappingPattern mapping,
                     std::uint32_t seed, std::int32_t tokens = 3, std::int32_t base = 63) {
     const std::int32_t max_context = base + tokens + 4;
     const std::size_t elements =
@@ -891,7 +1085,7 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
         positions[static_cast<std::size_t>(token)] = base + token;
     }
 
-    const HostCache initial = make_cache(geometry, dtype, max_context, seed + 10u);
+    const HostCache initial = make_cache(geometry, encoding, max_context, seed + 10u);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     DeviceCache cache(initial, mapping);
@@ -910,7 +1104,7 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
     cuda_synchronize();
 
     const std::string label = std::string("gqa_kv_append ") + geometry.name + " " +
-                              cache_name(dtype) + " mapping=" + mapping_name(mapping);
+                              cache_name(encoding) + " mapping=" + mapping_name(mapping);
     int failures = verify_cache(label, cache.snapshot(), expected);
     failures += verify_input(label + " k unchanged", dk, k_bits);
     failures += verify_input(label + " v unchanged", dv, v_bits);
@@ -919,7 +1113,8 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
     return failures;
 }
 
-int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
+int run_a1_case(const Geometry& geometry, PagedKVEncoding encoding,
+                const AttentionCase& test_case,
                 MappingPattern mapping) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
@@ -939,7 +1134,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
 
-    const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
+    const HostCache initial = make_cache(geometry, encoding, max_context, test_case.seed + 10u);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference = ideal_attention(q, expected, positions);
@@ -972,7 +1167,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, encoding, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -980,11 +1175,12 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
                        envelope, workspace, tout, nullptr);
     cuda_synchronize();
 
-    const std::string label = case_label("gqa_attention", geometry, dtype, test_case, mapping);
+    const std::string label =
+        case_label("gqa_attention", geometry, encoding, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(dtype));
+                                    attention_criterion(encoding));
     failures += verify_cache(label, cache.snapshot(), expected);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
@@ -1001,7 +1197,8 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     return failures;
 }
 
-int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
+int run_a3_case(const Geometry& geometry, PagedKVEncoding encoding,
+                const AttentionCase& test_case,
                 MappingPattern mapping) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
@@ -1015,7 +1212,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
 
-    const HostCache cache_host = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
+    const HostCache cache_host = make_cache(geometry, encoding, max_context, test_case.seed + 10u);
     const std::vector<double> reference = ideal_attention(q, cache_host, positions);
     DeviceCache cache(cache_host, mapping);
 
@@ -1034,7 +1231,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, encoding, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1043,11 +1240,11 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     cuda_synchronize();
 
     const std::string label =
-        case_label("gqa_attention_cached", geometry, dtype, test_case, mapping);
+        case_label("gqa_attention_cached", geometry, encoding, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(dtype));
+                                    attention_criterion(encoding));
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
@@ -1110,7 +1307,8 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
-int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCase& test_case) {
+int run_batch_case(const Geometry& geometry, PagedKVEncoding encoding,
+                   const BatchAttentionCase& test_case) {
     const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
     if (batch <= 0 || test_case.valid_columns.size() != static_cast<std::size_t>(batch) ||
         test_case.table_rows.size() != static_cast<std::size_t>(batch)) {
@@ -1153,7 +1351,7 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     initial.reserve(static_cast<std::size_t>(batch));
     for (std::int32_t row = 0; row < batch; ++row) {
         initial.push_back(
-            make_cache(geometry, dtype, max_context, test_case.seed + 20u + 3u * row));
+            make_cache(geometry, encoding, max_context, test_case.seed + 20u + 3u * row));
     }
     std::vector<HostCache> expected = initial;
     std::vector<double> reference(q_column_elements * columns, 0.0);
@@ -1208,7 +1406,7 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
                                              static_cast<std::uint32_t>(maximum_visible)};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, batch, test_case.width, test_case.width);
+        geometry.q_heads, encoding, envelope, batch, test_case.width, test_case.width);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1219,13 +1417,13 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     cuda_synchronize();
 
     const std::string label = std::string("gqa_attention batch ") + geometry.name + " " +
-                              cache_name(dtype) + " mapping=" + mapping_name(test_case.mapping) +
+                              cache_name(encoding) + " mapping=" + mapping_name(test_case.mapping) +
                               " B=" + std::to_string(batch) +
                               " W=" + std::to_string(test_case.width);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(dtype));
+                                    attention_criterion(encoding));
     failures += verify_invalid_columns_zero(label, output_bits, geometry, test_case.width,
                                             test_case.valid_columns);
     failures += cache.verify(label, expected);
@@ -1250,13 +1448,16 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
 
 int run_batch_cases() {
     int failures = 0;
-    failures += run_batch_case(kGeometries[0], DType::I8,
+    failures += run_batch_case(kGeometries[0], PagedKVEncoding::I8G64,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
-    failures += run_batch_case(kGeometries[0], DType::BF16,
+    // Fork: batch A1 covers packed I4 append plus decode with a partial row.
+    failures += run_batch_case(kGeometries[0], PagedKVEncoding::I4G64,
+                               {6, {127}, {3}, {0}, MappingPattern::Identity, 498u});
+    failures += run_batch_case(kGeometries[0], PagedKVEncoding::Bf16,
                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
-    failures += run_batch_case(kGeometries[0], DType::BF16,
+    failures += run_batch_case(kGeometries[0], PagedKVEncoding::Bf16,
                                {1, {63, 2048}, {1, 1}, {1, 0}, MappingPattern::Fragmented, 501u});
-    failures += run_batch_case(kGeometries[1], DType::I8,
+    failures += run_batch_case(kGeometries[1], PagedKVEncoding::I8G64,
                                {1,
                                 {0, 31, 63, 127, 511, 1023, 2047, 4095},
                                 {1, 1, 1, 1, 1, 1, 1, 1},
@@ -1264,24 +1465,27 @@ int run_batch_cases() {
                                 MappingPattern::Identity,
                                 502u});
     failures +=
-        run_batch_case(kGeometries[0], DType::I8,
+        run_batch_case(kGeometries[0], PagedKVEncoding::I8G64,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
-    failures += run_batch_case(kGeometries[1], DType::BF16,
+    failures += run_batch_case(kGeometries[1], PagedKVEncoding::Bf16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
     return failures;
 }
 
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    // Fork: run A1/A2/A3 and mapping coverage for every semantic paged-KV encoding.
+    for (const PagedKVEncoding encoding : {PagedKVEncoding::Bf16,
+                                           PagedKVEncoding::I8G64,
+                                           PagedKVEncoding::I4G64}) {
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
-            failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
-            failures += run_a1_case(geometry, dtype, {6, 61, 67, 190u}, mapping);
-            failures += run_a3_case(geometry, dtype, {1, 128, 129, 191u}, mapping);
+            failures += run_append_case(geometry, encoding, mapping, 100u + geometry.q_heads);
+            failures += run_a1_case(geometry, encoding, {6, 61, 67, 190u}, mapping);
+            failures += run_a3_case(geometry, encoding, {1, 128, 129, 191u}, mapping);
         }
-        if (dtype == DType::I8) {
-            failures += run_append_case(geometry, dtype, MappingPattern::Fragmented,
+        if (is_quantized(encoding)) {
+            failures += run_append_case(geometry, encoding, MappingPattern::Fragmented,
                                         150u + geometry.q_heads, 129, 61);
         }
 
@@ -1290,7 +1494,7 @@ int run_geometry(const Geometry& geometry) {
             {17, 31, 48, 204u}, {66, 63, 129, 205u},
         };
         for (const AttentionCase& test_case : a1_cases) {
-            failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
+            failures += run_a1_case(geometry, encoding, test_case, MappingPattern::Identity);
         }
 
         const AttentionCase a3_cases[] = {
@@ -1299,18 +1503,20 @@ int run_geometry(const Geometry& geometry) {
             {17, 31, 48, 303u},
         };
         for (const AttentionCase& test_case : a3_cases) {
-            failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
+            failures += run_a3_case(geometry, encoding, test_case, MappingPattern::Identity);
         }
 
         if (geometry.q_heads == 16) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.
-            failures += run_a1_case(geometry, dtype, {7, 17, 513, 401u}, MappingPattern::Identity);
-            failures += run_a3_case(geometry, dtype, {7, 17, 513, 402u}, MappingPattern::Identity);
             failures +=
-                run_a3_case(geometry, dtype, {16, 17, 1024, 403u}, MappingPattern::Identity);
+                run_a1_case(geometry, encoding, {7, 17, 513, 401u}, MappingPattern::Identity);
             failures +=
-                run_a3_case(geometry, dtype, {16, 17, 1025, 404u}, MappingPattern::Identity);
+                run_a3_case(geometry, encoding, {7, 17, 513, 402u}, MappingPattern::Identity);
+            failures +=
+                run_a3_case(geometry, encoding, {16, 17, 1024, 403u}, MappingPattern::Identity);
+            failures +=
+                run_a3_case(geometry, encoding, {16, 17, 1025, 404u}, MappingPattern::Identity);
         }
     }
     return failures;
@@ -1318,14 +1524,20 @@ int run_geometry(const Geometry& geometry) {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    // Fork: every native paged-KV encoding must be accepted by workspace planning.
+    (void)ops::gqa_attention_workspace_capacity_bytes(
+        16, PagedKVEncoding::I4G64, {1, 1025}, 1, 1, 1);
+    // Fork: interval capacity admits packed I4 as a first-class encoding.
+    for (const PagedKVEncoding encoding : {PagedKVEncoding::Bf16,
+                                           PagedKVEncoding::I8G64,
+                                           PagedKVEncoding::I4G64}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
-            ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);
+            ops::gqa_attention_workspace_capacity_bytes(16, encoding, envelope, 1, 1, 17);
         std::size_t witness = 0;
         for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
             witness = std::max(witness, ops::gqa_attention_workspace_capacity_bytes(
-                                            16, dtype, envelope, 1, tokens, tokens));
+                                            16, encoding, envelope, 1, tokens, tokens));
         }
         if (interval != witness) {
             std::cerr << "gqa_attention interval capacity has no exact route witness\n";
@@ -1334,14 +1546,14 @@ int verify_workspace_capacity_contract() {
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+            16, PagedKVEncoding::Bf16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
         std::cerr << "gqa_attention rejected its maximum visible-key envelope\n";
         ++failures;
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            16, PagedKVEncoding::Bf16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
         std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}

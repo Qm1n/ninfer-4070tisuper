@@ -61,6 +61,19 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+// Fork: translate the public storage selection once at the family planning boundary.
+PagedKVEncoding paged_kv_encoding(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return PagedKVEncoding::Bf16;
+    case KvCacheStorage::Int8Group64:
+        return PagedKVEncoding::I8G64;
+    case KvCacheStorage::Int4Group64:
+        return PagedKVEncoding::I4G64;
+    }
+    throw std::invalid_argument("unknown paged KV cache storage");
+}
+
 template <class ProfileAllowance>
 std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
                                      ProfileAllowance&& profile_allowance, const char* label) {
@@ -115,7 +128,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .capacity                  = plan.capacity,
                      .kv_heads                  = TextConfig::kv_heads,
                      .attention_head_dim        = TextConfig::head_dim,
-                     .kv_dtype                  = plan.kv_dtype,
+                     // Fork: plan persistent planes from semantic paged-KV encoding.
+                     .kv_encoding               = plan.kv_encoding,
                      .kv_quant_group            = plan.kv_quant_group,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
@@ -174,7 +188,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .max_context = plan.capacity,
                 .kv_heads    = DFlashConfig::kv_heads,
                 .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::BF16,
+                // Fork: DFlash's target-private Full pool remains BF16 encoded.
+                .encoding    = PagedKVEncoding::Bf16,
                 .quant_group = 0,
             };
             dflash.prefill_features = add_tensor(
@@ -259,7 +274,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
+                            TextConfig::query_heads, plan.kv_encoding, envelope, batch_size,
+                            min_width,
                             max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
@@ -325,7 +341,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
+                            TextConfig::query_heads, plan.kv_encoding, envelope, 1, tokens,
+                            tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
@@ -359,7 +376,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
+                            TextConfig::query_heads, plan.kv_encoding, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
@@ -432,7 +449,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
                 scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                                    TextConfig::query_heads, plan.kv_dtype, text_envelope, batch,
+                                    TextConfig::query_heads, plan.kv_encoding, text_envelope, batch,
                                     width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
@@ -624,7 +641,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->device              = inputs.device;
-    impl->kv_dtype            = inputs.kv_dtype;
+    // Fork: preserve semantic I4/I8/BF16 encoding through final plan construction.
+    impl->kv_encoding         = inputs.kv_encoding;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -698,7 +716,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
+        // Fork: packed I4 uses U8 physical planes but remains a distinct semantic encoding.
+        .kv_encoding    = paged_kv_encoding(options.kv_cache),
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),

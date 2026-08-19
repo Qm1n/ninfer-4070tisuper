@@ -87,7 +87,8 @@ PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
         .block_tables = Tensor(block_table.p, DType::I32, {kLogicalPages, table_rows}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
+        // Fork: DFlash-style paged prefix cache remains BF16 encoded.
+        .encoding     = PagedKVEncoding::Bf16,
         .quant_group  = 0,
     };
 }

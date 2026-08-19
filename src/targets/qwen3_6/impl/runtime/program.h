@@ -247,7 +247,8 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
-    const DType kv_dtype;
+    // Fork: Program carries semantic paged-KV encoding rather than a fractional DType surrogate.
+    const PagedKVEncoding kv_encoding;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
     const bool vision_enabled;

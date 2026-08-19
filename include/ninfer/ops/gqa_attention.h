@@ -20,27 +20,29 @@ struct GqaExecutionEnvelope {
 /**
  * Shared numerical contract for A1/A2/A3.
  *
+ * // Fork: add native packed I4-G64 to the shared numerical contract.
  * Public q/k/v inputs and BF16 cache values are interpreted after their BF16 storage boundary.
- * INT8-G64 cache rows use one FP16 scale for each contiguous 64-element group. For BF16 source
- * values x, their exact observable encoding is:
+ * INT8-G64 and I4-G64 cache rows use one FP16 scale for each contiguous 64-element group. For
+ * BF16 source values x, their exact observable encoding is:
  *
  *   a          = max_i abs(FP32(x[i]))
- *   scale_bits = FP16_RNE(a / 127)
+ *   scale_bits = FP16_RNE(a / M), M = 127 for INT8 and 7 for I4
  *   s          = FP32(scale_bits)
  *   inv        = s == 0 ? 0 : FP32(1 / s)
- *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(x[i]) * inv), -127, 127))
+ *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(x[i]) * inv), -M, M))
  *   decode[i]  = FP32(code[i]) * s
  *
- * A1 and A2 produce identical code and scale bits. The common ideal attention oracle uses BF16 Q
- * and logical cache values (BF16 values for a BF16 cache, FP32 decode above for INT8-G64), then
- * evaluates score dot products, stable softmax, and value reduction in FP64. The BF16 Op output is
- * promoted to FP64 for comparison with that result.
+ * I4 stores the even logical dimension in the low signed nibble and the following odd dimension
+ * in the high signed nibble. A1 and A2 produce identical code and scale bits. The common ideal
+ * attention oracle uses BF16 Q and logical cache values (BF16 values for a BF16 cache, FP32 decode
+ * above for INT8-G64 or I4-G64), then evaluates score dot products, stable softmax, and value
+ * reduction in FP64. The BF16 Op output is promoted to FP64 for comparison with that result.
  *
- * The registered INT8 implementation defines Q8-G64, paired with INT8-G64 K, as its native query
- * compute profile. Its profile-defined query quantization and any narrower staging do not replace
- * BF16 Q in the ideal oracle. BF16-cache and INT8-cache compute profiles therefore have separate
- * named numerical criteria owned by the GQA conformance test. Those envelopes apply to the
- * registered geometries, tested token extents, conformance matrix, and target-representative
+ * The registered quantized implementations define Q8-G64, paired with INT8-G64 or unpacked
+ * I4-G64 K, as their native query compute profile. Their profile-defined query quantization and
+ * any narrower staging do not replace BF16 Q in the ideal oracle. Each cache compute profile has a
+ * separate named numerical criterion owned by the GQA conformance test. Those envelopes apply to
+ * the registered geometries, tested token extents, conformance matrix, and target-representative
  * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
  * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
  * additional consistency check.
@@ -48,12 +50,13 @@ struct GqaExecutionEnvelope {
 
 /**
  * Returns the transient arena capacity required for every W in the inclusive interval at one
- * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
+ * exact logical batch size. Head geometry, cache encoding, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
  * return zero.
  */
 [[nodiscard]] std::size_t
-gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
+// Fork: packed I4 is selected by semantic cache encoding, not by a fractional DType.
+gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, PagedKVEncoding cache_encoding,
                                        GqaExecutionEnvelope envelope, std::int32_t batch_size,
                                        std::int32_t min_width, std::int32_t max_width);
 
@@ -72,8 +75,9 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
  * call topology; it is not inferred by copying device metadata to the host. B=1 accepts every
  * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16
- * or INT8-G64 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
- * planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence b.
+ * or INT8-G64 or I4-G64 under the shared numerical contract above. // Fork: I4 is first-class.
+ * PagedKVBatchLayerView supplies shared planes and the complete block-table matrix;
+ * kv_table_rows[b] selects one row for sequence b.
  *
  * In masked form, every row's valid columns are the prefix [0,valid_columns[b]); positions in that
  * prefix are sequential and address populated causal histories. Each nonempty row repeats its
@@ -94,8 +98,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
- * contiguous sequential I32 [T], and every addressed code and INT8 scale is overwritten. It reads
- * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
+ * contiguous sequential I32 [T], and every addressed quantized code and scale is overwritten. It
+ * reads no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
+ * // Fork: A2 covers both I8-G64 and packed I4-G64.
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                    PagedKVLayerView cache, cudaStream_t stream);

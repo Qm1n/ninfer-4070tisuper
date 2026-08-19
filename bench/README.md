@@ -36,6 +36,7 @@ decode graph before warmups and measured repetitions.
 
 ## CLI
 
+<!-- // Fork: benchmark CLI exposes the native I4 cache route. -->
 ```text
 ninfer_bench --weights <artifact.ninfer>
           [--corpus <ids-path>]
@@ -44,7 +45,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8>]
+          [--kv-dtype <bf16|int8|i4>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -60,7 +61,9 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
+<!-- // Fork: document the benchmark's native packed I4 selection. -->
+`bf16` selects BF16 KV storage, `int8` selects INT8 group-64 storage, and `i4` selects packed INT4
+group-64 storage. MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 

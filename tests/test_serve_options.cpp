@@ -59,6 +59,11 @@ int main() {
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
+    // Fork: serving accepts the native I4 cache option without translating it through DType.
+    const ServeOptions i4 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "i4"});
+    failures += check(i4.kv_cache == ninfer::KvCacheStorage::Int4Group64,
+                      "--kv-dtype i4 did not reach serving options");
+
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
     failures +=

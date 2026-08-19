@@ -39,15 +39,16 @@ void test_topology() {
     }
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
+// Fork: decoder plane inventory is keyed by semantic paged-KV encoding.
+q36::DecoderStateSpec decoder_spec(ninfer::PagedKVEncoding encoding, bool mtp) {
     return q36::DecoderStateSpec{
         .full_attention_layers     = 2,
         .mtp_layers                = 1,
         .capacity                  = 129,
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
-        .kv_dtype                  = dtype,
-        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .kv_encoding               = encoding,
+        .kv_quant_group = encoding == ninfer::PagedKVEncoding::Bf16 ? 0 : q36::kKvQuantGroup,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -68,7 +69,8 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
 void test_decoder_layout() {
     ninfer::LayoutBuilder bf16_builder;
     const q36::DecoderStateLayout bf16 =
-        q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
+        q36::plan_decoder_state(
+            bf16_builder, decoder_spec(ninfer::PagedKVEncoding::Bf16, false));
     (void)bf16_builder.finish(256);
     expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
     expect(bf16.text_kv.pool.spec.page_group_count == 5 &&
@@ -88,7 +90,8 @@ void test_decoder_layout() {
 
     ninfer::LayoutBuilder int8_builder;
     const q36::DecoderStateLayout int8 =
-        q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, true));
+        q36::plan_decoder_state(
+            int8_builder, decoder_spec(ninfer::PagedKVEncoding::I8G64, true));
     (void)int8_builder.finish(256);
     expect(int8.text_kv.pool.planes.size() == 8 &&
                int8.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
@@ -104,6 +107,41 @@ void test_decoder_layout() {
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    // Fork: I4 uses half-width U8 code planes plus the same four FP16 scale rows per token.
+    ninfer::LayoutBuilder int4_builder;
+    const q36::DecoderStateLayout int4 = q36::plan_decoder_state(
+        int4_builder, decoder_spec(ninfer::PagedKVEncoding::I4G64, true));
+    (void)int4_builder.finish(256);
+    expect(int4.text_kv.encoding == ninfer::PagedKVEncoding::I4G64 &&
+               int4.text_kv.pool.planes.size() == 8 &&
+               int4.text_kv.pool.planes[0].spec.dtype == ninfer::DType::U8 &&
+               int4.text_kv.pool.planes[0].spec.leading_extent == 32 &&
+               int4.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
+               int4.text_kv.pool.planes[2].spec.leading_extent == 1,
+           "INT4 Text KV has half-width code and G64 scale planes per layer");
+    expect(int4.mtp_kv.has_value() &&
+               int4.mtp_kv->encoding == ninfer::PagedKVEncoding::I4G64 &&
+               int4.mtp_kv->pool.planes.size() == 4 &&
+               int4.mtp_kv->pool.planes[0].spec.dtype == ninfer::DType::U8 &&
+               int4.mtp_kv->pool.planes[0].spec.leading_extent == 32,
+           "INT4 MTP KV has native packed code planes");
+    expect(int4.text_kv.payload_bytes() < int8.text_kv.payload_bytes(),
+           "INT4 Text KV payload is smaller than INT8");
+
+    // Fork: pin the 27B 131,072-token plain-decode KV capacity curve at exactly 2.125 GiB.
+    q36::DecoderStateSpec i4_131k_spec = decoder_spec(ninfer::PagedKVEncoding::I4G64, false);
+    i4_131k_spec.full_attention_layers     = 16;
+    i4_131k_spec.capacity                  = 131072;
+    i4_131k_spec.kv_heads                  = 4;
+    i4_131k_spec.attention_head_dim        = 256;
+    i4_131k_spec.text_physical_page_groups = 2048;
+    ninfer::LayoutBuilder i4_131k_builder;
+    const q36::DecoderStateLayout i4_131k =
+        q36::plan_decoder_state(i4_131k_builder, i4_131k_spec);
+    (void)i4_131k_builder.finish(256);
+    expect(i4_131k.kv_payload_bytes() == 2281701376ULL,
+           "131K INT4 Text KV payload is not exactly 2.125 GiB");
 }
 
 void test_round_layout() {

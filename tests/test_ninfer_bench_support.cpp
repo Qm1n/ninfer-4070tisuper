@@ -80,7 +80,8 @@ int test_cli_contract() {
         "--prefill-chunk",
         "128",
         "--kv-dtype",
-        "int8",
+        // Fork: product benchmark parsing accepts the native I4 cache selection.
+        "i4",
         "--mtp-draft-tokens",
         "5",
         "--lm-head-draft",
@@ -102,7 +103,8 @@ int test_cli_contract() {
     failures += expect(parsed.repetitions == 3 && parsed.warmup == 2, "repetition settings");
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
-    failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
+    // Fork: preserve I4 through the benchmark option contract.
+    failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int4Group64, "I4 KV");
     failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");

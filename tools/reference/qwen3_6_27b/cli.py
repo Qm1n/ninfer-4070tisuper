@@ -72,7 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory", default="auto")
     parser.add_argument("--headroom", default="2GiB")
     parser.add_argument("--prefill-chunk", type=int, default=CFG.prefill_chunk)
-    parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16")
+    # // Fork: expose the reference I4-G64 codec for parity diagnostics.
+    parser.add_argument("--kv-dtype", choices=("bf16", "int8", "i4"), default="bf16")
     parser.add_argument(
         "--mtp-draft-tokens",
         type=int,

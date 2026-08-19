@@ -82,6 +82,11 @@ def estimate_fixed_bytes(
         kv_per_layer_token = 2 * CFG.kv_heads * (
             CFG.head_dim + CFG.head_dim // 64 * 2
         )
+    # // Fork: packed I4 codes occupy D/2 bytes and retain FP16 G64 scales.
+    elif kv_dtype == "i4":
+        kv_per_layer_token = 2 * CFG.kv_heads * (
+            CFG.head_dim // 2 + CFG.head_dim // 64 * 2
+        )
     else:
         raise ValueError(f"unsupported KV dtype: {kv_dtype!r}")
     kv = capacity * kv_layers * kv_per_layer_token

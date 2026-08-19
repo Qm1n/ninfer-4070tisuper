@@ -183,7 +183,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
-      kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      // Fork: Program retains the semantic paged-KV encoding selected at startup.
+      kv_encoding(plan.kv_encoding), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -2209,7 +2210,18 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    // Fork: surface the exact paged-KV encoding in memory summaries and request logs.
+    switch (kv_encoding) {
+    case PagedKVEncoding::Bf16:
+        out.kv_cache = KvCacheStorage::BFloat16;
+        break;
+    case PagedKVEncoding::I8G64:
+        out.kv_cache = KvCacheStorage::Int8Group64;
+        break;
+    case PagedKVEncoding::I4G64:
+        out.kv_cache = KvCacheStorage::Int4Group64;
+        break;
+    }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

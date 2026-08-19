@@ -265,7 +265,8 @@ PagedKVLayerView make_full_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& 
         .block_table   = Tensor(block_table.p, DType::I32, {pages}),
         .head_dim      = kFullHeadDim,
         .num_kv_heads  = geometry.kv_heads,
-        .dtype         = dtype,
+        // Fork: this existing benchmark matrix covers BF16 and I8 semantic encodings.
+        .encoding     = dtype == DType::I8 ? PagedKVEncoding::I8G64 : PagedKVEncoding::Bf16,
         .quant_group   = quantized ? kKvGroup : 0,
     };
 }
@@ -340,7 +341,7 @@ PagedKVBatchLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
         .block_tables = Tensor(block_tables.p, DType::I32, {kRingCapacity / kPagedKVPageSize, 1}),
         .head_dim     = kPrefixHeadDim,
         .num_kv_heads = kPrefixKvHeads,
-        .dtype        = DType::BF16,
+        .encoding     = PagedKVEncoding::Bf16, // Fork: prefix storage is explicitly BF16.
         .quant_group  = 0,
     };
 }

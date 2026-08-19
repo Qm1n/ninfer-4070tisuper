@@ -21,12 +21,22 @@ namespace ninfer::ops {
 inline constexpr int kGqaKvQuantHeadDim = 256;
 inline constexpr int kGqaKvQuantGroup   = 64;
 inline constexpr int kGqaKvQuantGroups  = kGqaKvQuantHeadDim / kGqaKvQuantGroup;
+// Fork: signed I4-G64 stores two logical dimensions in each U8 code byte.
+inline constexpr int kGqaKvI4CodeHeadDim = kGqaKvQuantHeadDim / 2;
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_code_index(int physical_page, int kv_head,
                                                                 int d, int page_offset) {
     return paged_kv_element_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head,
                                                                           page_offset, d);
+}
+
+// Fork: packed I4 code planes address bytes, not fractional DType elements.
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t gqa_kv_quant_i4_code_index(
+    int physical_page, int kv_head, int code_byte, int page_offset) {
+    return paged_kv_element_offset<kGqaKvI4CodeHeadDim, Geometry::KVHeads>(
+        physical_page, kv_head, page_offset, code_byte);
 }
 
 template <typename Geometry>
@@ -52,6 +62,48 @@ __device__ __forceinline__ std::int8_t gqa_kv_quant_code(float x, float inv_scal
     int q = __float2int_rn(x * inv_scale);
     q     = max(-127, min(127, q));
     return static_cast<std::int8_t>(q);
+}
+
+// Fork: exact symmetric signed-nibble codec; -8 remains deliberately unused.
+__device__ __forceinline__ std::int8_t gqa_kv_quant_i4_code(float x, float inv_scale) {
+    if (inv_scale == 0.0f) { return static_cast<std::int8_t>(0); }
+    int q = __float2int_rn(x * inv_scale);
+    q     = max(-7, min(7, q));
+    return static_cast<std::int8_t>(q);
+}
+
+// Fork: low nibble is the even dimension and high nibble is the following odd dimension.
+__device__ __forceinline__ std::uint8_t gqa_kv_pack_i4_pair(std::int8_t even,
+                                                            std::int8_t odd) {
+    return static_cast<std::uint8_t>((static_cast<std::uint8_t>(even) & 0x0fu) |
+                                     ((static_cast<std::uint8_t>(odd) & 0x0fu) << 4));
+}
+
+// Fork: KV-local form of the signed-nibble XOR/subtract decode atom used by Q4 row-split.
+__device__ __forceinline__ int2 gqa_kv_unpack_i4x8_to_i8(const std::uint8_t* codes4) {
+    const std::uint32_t packed = load_vec<std::uint32_t>(codes4);
+    int2 decoded{};
+    auto* bytes = reinterpret_cast<std::int8_t*>(&decoded);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int nibble = static_cast<int>((packed >> (4 * i)) & 0x0fu);
+        bytes[i]         = static_cast<std::int8_t>((nibble ^ 0x08) - 0x08);
+    }
+    return decoded;
+}
+
+// Fork: unpack eight signed nibbles and apply their FP16-rounded group scale to BF16.
+__device__ __forceinline__ int4 gqa_kv_dequant_i4x8_from(const std::uint8_t* codes4, float s) {
+    const int2 raw       = gqa_kv_unpack_i4x8_to_i8(codes4);
+    const auto* c        = reinterpret_cast<const std::int8_t*>(&raw);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        packed[i] = pack_bf16x2(static_cast<float>(c[2 * i]) * s,
+                                static_cast<float>(c[2 * i + 1]) * s);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
 // Dequantize 8 consecutive int8 codes (dims [d, d+8), aligned to a multiple of 8

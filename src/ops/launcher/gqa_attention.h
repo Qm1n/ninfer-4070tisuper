@@ -24,7 +24,9 @@ struct GqaSmallTInvocation {
 };
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                          DType cache_dtype, GqaExecutionEnvelope envelope);
+                                          // Fork: dispatch split policy by semantic KV encoding.
+                                          PagedKVEncoding cache_encoding,
+                                          GqaExecutionEnvelope envelope);
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 

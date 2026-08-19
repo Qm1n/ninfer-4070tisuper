@@ -301,6 +301,11 @@ std::size_t scale_plane_bytes(const Geometry& geometry, std::int32_t physical_pa
            physical_pages * dtype_size(DType::FP16);
 }
 
+// Fork: adapt legacy BF16/I8 operator benchmark choices to semantic paged-cache encodings.
+PagedKVEncoding cache_encoding(DType dtype) {
+    return dtype == DType::I8 ? PagedKVEncoding::I8G64 : PagedKVEncoding::Bf16;
+}
+
 PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
                                  DeviceBuffer& v_scale, DeviceBuffer& block_table,
                                  const Geometry& geometry, DType dtype, std::int32_t padded) {
@@ -325,7 +330,7 @@ PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer&
         .block_table   = Tensor(block_table.p, DType::I32, {logical_pages}),
         .head_dim      = kHeadDim,
         .num_kv_heads  = geometry.kv_heads,
-        .dtype         = dtype,
+        .encoding      = cache_encoding(dtype), // Fork: the view no longer overloads DType.
         .quant_group   = quantized ? kKvGroup : 0,
     };
 }
@@ -339,7 +344,7 @@ PagedKVBatchLayerView make_batch_cache_view(const PagedKVLayerView& cache) {
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
-        .dtype         = cache.dtype,
+        .encoding      = cache.encoding, // Fork: preserve the semantic cache encoding.
         .quant_group   = cache.quant_group,
     };
 }
@@ -360,8 +365,9 @@ std::size_t workspace_capacity(const Geometry& geometry, DType dtype, std::int32
                                std::int32_t batch, std::int32_t visible) {
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
                                              static_cast<std::uint32_t>(visible)};
-    return ops::gqa_attention_workspace_capacity_bytes(geometry.query_heads, dtype, envelope, batch,
-                                                       tokens, tokens);
+    // Fork: workspace selection follows the semantic paged-cache encoding.
+    return ops::gqa_attention_workspace_capacity_bytes(
+        geometry.query_heads, cache_encoding(dtype), envelope, batch, tokens, tokens);
 }
 
 std::int32_t profile_visible(std::span<const std::int32_t> contexts,

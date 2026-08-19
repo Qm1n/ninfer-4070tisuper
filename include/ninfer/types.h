@@ -26,6 +26,8 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    // Fork: native signed-nibble paged KV storage with one FP16 scale per 64 values.
+    Int4Group64,
 };
 
 enum class KvCapacityMode : std::uint8_t {

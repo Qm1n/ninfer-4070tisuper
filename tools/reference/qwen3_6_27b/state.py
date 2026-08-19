@@ -11,8 +11,9 @@ from .config import CFG
 
 class KVCache:
     def __init__(self, layers: int, capacity: int, device: torch.device, dtype: str = "bf16"):
-        if dtype not in {"bf16", "int8"}:
-            raise ValueError(f"kv dtype must be bf16/int8, got {dtype!r}")
+        # // Fork: mirror the product's native signed-nibble G64 cache option.
+        if dtype not in {"bf16", "int8", "i4"}:
+            raise ValueError(f"kv dtype must be bf16/int8/i4, got {dtype!r}")
         if capacity <= 0:
             raise ValueError("KV capacity must be positive")
         self.layers = layers
@@ -32,9 +33,17 @@ class KVCache:
         if self.dtype == "bf16":
             self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
             self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
-        else:
+        elif self.dtype == "int8":
             self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
             self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
+            scales = (self.capacity, CFG.kv_heads, CFG.head_dim // 64)
+            self._ks[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
+            self._vs[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
+        else:
+            # // Fork: reference storage preserves the exact two-nibbles-per-U8 physical codec.
+            packed_shape = (self.capacity, CFG.kv_heads, CFG.head_dim // 2)
+            self._k[layer] = torch.empty(packed_shape, device=self.device, dtype=torch.uint8)
+            self._v[layer] = torch.empty(packed_shape, device=self.device, dtype=torch.uint8)
             scales = (self.capacity, CFG.kv_heads, CFG.head_dim // 64)
             self._ks[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
             self._vs[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
@@ -53,6 +62,32 @@ class KVCache:
         groups = code.float().reshape(*code.shape[:-1], CFG.head_dim // 64, 64)
         return (groups * scale.float().unsqueeze(-1)).reshape_as(code).to(torch.bfloat16)
 
+    # // Fork: exact I4-G64 logical quantizer with FP16_RNE(amax/7) scales.
+    @staticmethod
+    def _quantize_i4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        groups = x.float().reshape(*x.shape[:-1], CFG.head_dim // 64, 64)
+        scale = (groups.abs().amax(dim=-1) / 7.0).to(torch.float16)
+        safe_scale = torch.where(scale == 0, torch.ones_like(scale), scale).float()
+        code = torch.round(groups / safe_scale.unsqueeze(-1)).clamp(-7, 7).to(torch.int8)
+        code = torch.where((scale == 0).unsqueeze(-1), 0, code).to(torch.int8)
+        return code.reshape_as(x), scale
+
+    # // Fork: low nibble is the even logical dimension, high nibble the following odd one.
+    @staticmethod
+    def _pack_i4(code: torch.Tensor) -> torch.Tensor:
+        even = code[..., 0::2].to(torch.int16) & 0x0F
+        odd = (code[..., 1::2].to(torch.int16) & 0x0F) << 4
+        return (even | odd).to(torch.uint8)
+
+    # // Fork: signed-nibble XOR/subtract decode mirrors the CUDA atom.
+    @staticmethod
+    def _unpack_i4(packed: torch.Tensor) -> torch.Tensor:
+        low = packed.to(torch.int16) & 0x0F
+        high = (packed.to(torch.int16) >> 4) & 0x0F
+        low = (low ^ 0x08) - 0x08
+        high = (high ^ 0x08) - 0x08
+        return torch.stack((low, high), dim=-1).reshape(*packed.shape[:-1], -1).to(torch.int8)
+
     def write(self, layer: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         end = start + k.shape[0]
         if start < 0 or end > self.capacity or v.shape != k.shape:
@@ -61,11 +96,19 @@ class KVCache:
         if self.dtype == "bf16":
             self._k[layer][start:end].copy_(k)
             self._v[layer][start:end].copy_(v)
-        else:
+        elif self.dtype == "int8":
             kc, ks = self._quantize(k)
             vc, vs = self._quantize(v)
             self._k[layer][start:end].copy_(kc)
             self._v[layer][start:end].copy_(vc)
+            self._ks[layer][start:end].copy_(ks)
+            self._vs[layer][start:end].copy_(vs)
+        else:
+            # // Fork: persist packed I4 codes and exact FP16 scales.
+            kc, ks = self._quantize_i4(k)
+            vc, vs = self._quantize_i4(v)
+            self._k[layer][start:end].copy_(self._pack_i4(kc))
+            self._v[layer][start:end].copy_(self._pack_i4(vc))
             self._ks[layer][start:end].copy_(ks)
             self._vs[layer][start:end].copy_(vs)
 
@@ -74,9 +117,15 @@ class KVCache:
             raise ValueError("KV read range or layer mismatch")
         if self.dtype == "bf16":
             return self._k[layer][:end], self._v[layer][:end]
+        if self.dtype == "int8":
+            return (
+                self._dequantize(self._k[layer][:end], self._ks[layer][:end]),
+                self._dequantize(self._v[layer][:end], self._vs[layer][:end]),
+            )
+        # // Fork: decode packed signed nibbles before applying their G64 scales.
         return (
-            self._dequantize(self._k[layer][:end], self._ks[layer][:end]),
-            self._dequantize(self._v[layer][:end], self._vs[layer][:end]),
+            self._dequantize(self._unpack_i4(self._k[layer][:end]), self._ks[layer][:end]),
+            self._dequantize(self._unpack_i4(self._v[layer][:end]), self._vs[layer][:end]),
         )
 
     def rewind(self, position: int) -> None:

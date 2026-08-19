@@ -27,6 +27,7 @@
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -55,11 +56,12 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // dequantize V while producers execute QK. After both consume the code tile, the
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput,
+          typename CacheCode>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_i8_tiled_kernel(
-        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
-        std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
+        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheCode* cache_k_codes,
+        CacheCode* cache_v_codes, __half* cache_k_scale, __half* cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
@@ -83,6 +85,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PageIds         = 64;
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
+    // Fork: unsigned code elements select the packed signed-nibble storage route.
+    constexpr bool I4             = std::is_same_v<CacheCode, std::uint8_t>;
     constexpr float Log2E         = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
 
@@ -92,6 +96,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(Wc % RowTiles == 0);
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
+    static_assert(I4 || std::is_same_v<CacheCode, std::int8_t>);
 
     // Keep Q in a compact dedicated tile so the producer can reload one
     // 64-dimension group at a time instead of carrying all eight fragments in
@@ -103,10 +108,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     std::int8_t* r_s      = DynamicArena ? dynamic_r_s : static_r_s;
     std::int8_t* q_i8     = q_s;
     float* q_scale_tmp    = reinterpret_cast<float*>(r_s);
-    std::int8_t* k_i8     = r_s;
+    // Fork: I4 stages packed K/V, unpacked K, and BF16 V in the same 4D/key arena.
+    std::uint8_t* k_i4    = reinterpret_cast<std::uint8_t*>(r_s);
+    std::uint8_t* v_i4    = k_i4 + Bc * D / 2;
+    std::int8_t* k_i8     = I4 ? r_s + Bc * D : r_s;
     __nv_bfloat16* q_b16  = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16  = reinterpret_cast<__nv_bfloat16*>(k_i8);
-    std::int8_t* v_i8     = r_s + Bc * D;
+    std::int8_t* v_i8     = I4 ? nullptr : r_s + Bc * D;
     __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D);
     __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
     __shared__ float alpha_s[Br];
@@ -215,8 +223,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (position < split_start || position >= split_end) { continue; }
             int physical_page       = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
             const int page_offset   = position & kPagedKVPageMask;
-            const int d0            = grp * kGqaKvQuantGroup + lane;
-            const int d1            = d0 + 32;
+            // Fork: I4 lanes own adjacent values so each lane emits one packed code byte.
+            const int d0 = grp * kGqaKvQuantGroup + (I4 ? 2 * lane : lane);
+            const int d1 = I4 ? d0 + 1 : d0 + 32;
             const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
             const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
             const float kv0         = __bfloat162float(input.k[src0]);
@@ -227,21 +236,35 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
             kamax                   = warp_max(kamax, FullMask);
             vamax                   = warp_max(vamax, FullMask);
-            const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
-            const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
+            const float code_max    = I4 ? 7.0f : 127.0f;
+            const __half ksh = __float2half_rn(kamax > 0.0f ? kamax / code_max : 0.0f);
+            const __half vsh = __float2half_rn(vamax > 0.0f ? vamax / code_max : 0.0f);
             const float ks          = __half2float(ksh);
             const float vs          = __half2float(vsh);
             const float k_inv       = ks > 0.0f ? 1.0f / ks : 0.0f;
             const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
             physical_page           = __shfl_sync(FullMask, physical_page, 0);
-            cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                gqa_kv_quant_code(kv0, k_inv);
-            cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                gqa_kv_quant_code(kv1, k_inv);
-            cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                gqa_kv_quant_code(vv0, v_inv);
-            cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                gqa_kv_quant_code(vv1, v_inv);
+            if constexpr (I4) {
+                const std::int64_t co = gqa_kv_quant_i4_code_index<Geometry>(
+                    physical_page, kv_head, d0 / 2, page_offset);
+                cache_k_codes[co] = gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(kv0, k_inv),
+                                                        gqa_kv_quant_i4_code(kv1, k_inv));
+                cache_v_codes[co] = gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(vv0, v_inv),
+                                                        gqa_kv_quant_i4_code(vv1, v_inv));
+            } else {
+                cache_k_codes[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0,
+                                                                 page_offset)] =
+                    gqa_kv_quant_code(kv0, k_inv);
+                cache_k_codes[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1,
+                                                                 page_offset)] =
+                    gqa_kv_quant_code(kv1, k_inv);
+                cache_v_codes[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0,
+                                                                 page_offset)] =
+                    gqa_kv_quant_code(vv0, v_inv);
+                cache_v_codes[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1,
+                                                                 page_offset)] =
+                    gqa_kv_quant_code(vv1, v_inv);
+            }
             if (lane == 0) {
                 const std::int64_t so =
                     gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, grp, page_offset);
@@ -327,20 +350,36 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
             }
         }
+        // Fork: packed I4 performs 16-byte loads for 32 dimensions, exactly half I8 traffic.
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
-            const int key_l = chunk / (D / 16);
-            const int dc    = chunk - key_l * (D / 16);
-            const int d     = dc * 16;
-            const int key   = tile_k0 + key_l;
+        for (int chunk = tid; chunk < Bc * (D / (I4 ? 32 : 16)); chunk += Threads) {
+            constexpr int DimsPerLoad = I4 ? 32 : 16;
+            const int key_l           = chunk / (D / DimsPerLoad);
+            const int dc              = chunk - key_l * (D / DimsPerLoad);
+            const int d               = dc * DimsPerLoad;
+            const int key             = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = gqa_kv_quant_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
-                std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                if constexpr (I4) {
+                    const std::int64_t off = gqa_kv_quant_i4_code_index<Geometry>(
+                        physical_page, kv_head, d / 2, key & kPagedKVPageMask);
+                    ninfer::ops::cp_async<16>(&k_i4[key_l * D / 2 + d / 2],
+                                              &cache_k_codes[off]);
+                    ninfer::ops::cp_async<16>(&v_i4[key_l * D / 2 + d / 2],
+                                              &cache_v_codes[off]);
+                } else {
+                    const std::int64_t off = gqa_kv_quant_code_index<Geometry>(
+                        physical_page, kv_head, d, key & kPagedKVPageMask);
+                    std::int8_t* dst =
+                        &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
+                    ninfer::ops::cp_async<16>(dst, &cache_k_codes[off]);
+                    ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_codes[off]);
+                }
+            } else if constexpr (I4) {
+                store_vec(&k_i4[key_l * D / 2 + d / 2], make_int4(0, 0, 0, 0));
+                store_vec(&v_i4[key_l * D / 2 + d / 2], make_int4(0, 0, 0, 0));
             } else {
-                std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
+                std::int8_t* dst =
+                    &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));
                 store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
             }
@@ -355,6 +394,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+
+        // Fork: cooperatively unpack K4 before QK; V4 remains overlapped with QK below.
+        if constexpr (I4) {
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+                const int key_l = chunk / (D / 8);
+                const int dc    = chunk - key_l * (D / 8);
+                const int d     = dc * 8;
+                std::int8_t* kd =
+                    &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 4) * 2];
+                store_vec(kd, gqa_kv_unpack_i4x8_to_i8(&k_i4[key_l * D / 2 + d / 2]));
+            }
+            __syncthreads();
+        }
 
         // One warp per row tile produces P and alpha while the remaining warps
         // stream/dequant V.
@@ -505,7 +558,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs));
+                    // Fork: consumer warps unpack V4 to BF16 while producer warps execute QK.
+                    if constexpr (I4) {
+                        store_vec(dst,
+                                  gqa_kv_dequant_i4x8_from(&v_i4[key_l * D / 2 + d / 2], vs));
+                    } else {
+                        store_vec(dst, gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs));
+                    }
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }

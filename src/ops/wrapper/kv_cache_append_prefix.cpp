@@ -70,7 +70,9 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
 
 void validate_paged_cache(const PagedKVBatchLayerView& cache,
                           KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
+    // Fork: DFlash prefix append remains explicitly BF16 under the new encoding metadata.
+    if (cache.encoding != PagedKVEncoding::Bf16 || cache.quant_group != 0 ||
+        cache.num_kv_heads != kKVHeads ||
         cache.head_dim != kHeadDim || cache.k_pages.ne[2] <= 0 ||
         cache.k_pages.ne[2] != cache.v_pages.ne[2] || cache.block_tables.ne[0] <= 0 ||
         envelope.max_count >

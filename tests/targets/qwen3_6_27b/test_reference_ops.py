@@ -60,6 +60,34 @@ def test_int8_kv_codec_matches_fp16_scale_contract() -> None:
     assert np.array_equal(code.numpy(), expected_code.reshape(code.shape))
 
 
+# // Fork: pin exact I4 code, scale, packing, and signed-nibble decode semantics.
+def test_int4_kv_codec_matches_fp16_scale_contract() -> None:
+    generator = torch.Generator().manual_seed(12)
+    value = torch.randn(
+        3, CFG.kv_heads, CFG.head_dim, generator=generator, dtype=torch.bfloat16
+    )
+    code, scale = KVCache._quantize_i4(value)
+    packed = KVCache._pack_i4(code)
+    source = value.float().numpy().reshape(3, CFG.kv_heads, CFG.head_dim // 64, 64)
+    expected_scale = (np.max(np.abs(source), axis=-1) / np.float32(7.0)).astype(
+        np.float16
+    )
+    safe = np.where(expected_scale == 0, np.float16(1), expected_scale).astype(
+        np.float32
+    )
+    expected_code = np.rint(source / safe[..., None]).clip(-7, 7).astype(np.int8)
+    expected_code[expected_scale == 0] = 0
+    expected_code = expected_code.reshape(code.shape)
+    expected_packed = (
+        (expected_code[..., 0::2].astype(np.uint8) & np.uint8(0x0F))
+        | ((expected_code[..., 1::2].astype(np.uint8) & np.uint8(0x0F)) << 4)
+    )
+    assert np.array_equal(scale.numpy().view(np.uint16), expected_scale.view(np.uint16))
+    assert np.array_equal(code.numpy(), expected_code)
+    assert np.array_equal(packed.numpy(), expected_packed)
+    assert torch.equal(KVCache._unpack_i4(packed), code)
+
+
 def test_t1_gdn_matches_sequential_oracle() -> None:
     generator = torch.Generator().manual_seed(19)
     q = torch.randn(1, CFG.gdn_k_heads, CFG.gdn_k_dim, generator=generator).to(

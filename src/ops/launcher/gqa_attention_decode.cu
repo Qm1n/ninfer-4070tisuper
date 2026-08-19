@@ -41,19 +41,21 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
 }
 
 template <typename Geometry>
-std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
+std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens,
+                                     PagedKVEncoding encoding) {
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
-    if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
+    // Fork: packed I4 shares the quantized decode scheduling policy.
+    if (encoding != PagedKVEncoding::Bf16 && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::DecodeSplitScale);
     }
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
+    if (encoding != PagedKVEncoding::Bf16 && tokens == 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (encoding != PagedKVEncoding::Bf16 && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
@@ -65,12 +67,12 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
 
 template <typename Geometry>
 std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int32_t tokens,
-                                         DType dtype) {
+                                         PagedKVEncoding encoding) {
     std::int32_t capacity = 0;
     const auto include    = [&](std::uint32_t window) {
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
         const auto splits =
-            gqa_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, dtype);
+            gqa_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, encoding);
         capacity = capacity > splits ? capacity : splits;
     };
     include(envelope.min_visible_keys);
@@ -111,7 +113,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput,
+          typename CacheCode>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -129,16 +132,18 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                     MultiBatch, Masked, CacheInput>,
+                                                     MultiBatch, Masked, CacheInput, CacheCode>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                             KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
+                                             KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput,
+                                             CacheCode>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
-                static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
-                static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+                static_cast<const std::int32_t*>(pos.data),
+                static_cast<CacheCode*>(cache_k.data), static_cast<CacheCode*>(cache_v.data),
+                static_cast<__half*>(cache_k_scale.data),
                 static_cast<__half*>(cache_v_scale.data),
                 static_cast<const std::int32_t*>(cache.block_tables.data),
                 invocation.valid_columns == nullptr
@@ -208,7 +213,8 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
-        .dtype         = cache.dtype,
+        // Fork: preserve packed I4 identity in the single-row adapter.
+        .encoding      = cache.encoding,
         .quant_group   = cache.quant_group,
     };
 }
@@ -218,16 +224,21 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                          DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+                                          PagedKVEncoding cache_encoding,
+                                          GqaExecutionEnvelope envelope) {
+    // Fork: all three closed encodings are valid split-policy profiles.
+    if ((cache_encoding != PagedKVEncoding::Bf16 &&
+         cache_encoding != PagedKVEncoding::I8G64 &&
+         cache_encoding != PagedKVEncoding::I4G64) ||
+        tokens < 1 || tokens > 6 ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
     if (q_heads == Gqa27Geometry::QHeads) {
-        return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
+        return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_encoding);
     }
     if (q_heads == Gqa35Geometry::QHeads) {
-        return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
+        return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_encoding);
     }
     throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
 }
@@ -242,15 +253,21 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
-        gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+        gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.encoding);
 
-    // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
-    // geometry inside launch_tc_partial_i8.
+    // Fork: BF16 keeps its row-tile warp count; I8/I4 share the quantized producer/consumer
+    // geometry while selecting distinct physical code types.
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.dtype == DType::I8) {                                                        \
-                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
+            if (cache.encoding == PagedKVEncoding::I8G64) {                                      \
+                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, CacheInput,           \
+                                     std::int8_t>(                                                 \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.encoding == PagedKVEncoding::I4G64) {                                \
+                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, CacheInput,           \
+                                     std::uint8_t>(                                                \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else {                                                                               \
@@ -301,8 +318,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
-    const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
+    const auto launch_reduce = [&]<bool Quantized, bool MultiBatch, bool Masked, bool Offset>() {
+        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Quantized, MultiBatch, Masked,
                                                    Offset>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
@@ -316,30 +333,31 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
     };
     const bool masked         = invocation.valid_columns != nullptr;
-    const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
+    const auto launch_profile = [&]<bool Quantized, bool MultiBatch, bool Masked>() {
         if (invocation.column_begin == 0) {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, false>();
+            launch_reduce.template operator()<Quantized, MultiBatch, Masked, false>();
         } else {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, true>();
+            launch_reduce.template operator()<Quantized, MultiBatch, Masked, true>();
         }
     };
-    const auto launch_for_dtype = [&]<bool Int8>() {
+    const auto launch_for_encoding = [&]<bool Quantized>() {
         if (invocation.batch_size == 1) {
             if (masked) {
-                launch_profile.template operator()<Int8, false, true>();
+                launch_profile.template operator()<Quantized, false, true>();
             } else {
-                launch_profile.template operator()<Int8, false, false>();
+                launch_profile.template operator()<Quantized, false, false>();
             }
         } else if (masked) {
-            launch_profile.template operator()<Int8, true, true>();
+            launch_profile.template operator()<Quantized, true, true>();
         } else {
-            launch_profile.template operator()<Int8, true, false>();
+            launch_profile.template operator()<Quantized, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
-        launch_for_dtype.template operator()<true>();
+    // Fork: I4 and I8 use the quantized active-split/reduction profile.
+    if (cache.encoding != PagedKVEncoding::Bf16) {
+        launch_for_encoding.template operator()<true>();
     } else {
-        launch_for_dtype.template operator()<false>();
+        launch_for_encoding.template operator()<false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

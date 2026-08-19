@@ -48,7 +48,8 @@ int main() {
     options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
     options.log_stats_interval_ms          = 2500;
-    options.kv_cache                       = ninfer::KvCacheStorage::Int8Group64;
+    // Fork: request logs expose the native I4 cache format tag.
+    options.kv_cache                       = ninfer::KvCacheStorage::Int4Group64;
     options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens       = 3;
     options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
@@ -81,7 +82,8 @@ int main() {
     memory.kv_capacity                       = 524288;
     memory.kv_capacity_page_groups           = 8192;
     memory.kv_capacity_max_page_groups       = 16384;
-    memory.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    // Fork: keep load-memory and configured format tags consistent for I4.
+    memory.kv_cache                          = ninfer::KvCacheStorage::Int4Group64;
     memory.weights.capacity_bytes            = 100;
     memory.sequence.capacity_bytes           = 200;
     memory.workspace.capacity_bytes          = 300;
@@ -131,7 +133,8 @@ int main() {
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
-    failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
+    // Fork: lock the externally recorded I4 cache spelling.
+    failures += check(server.at("engine").at("kv_cache") == "int4-group64", "KV type missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");

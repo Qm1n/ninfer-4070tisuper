@@ -14,6 +14,13 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// Fork: cache encoding is semantic metadata; physical planes keep ordinary integral DTypes.
+enum class PagedKVEncoding : std::uint8_t {
+    Bf16,
+    I8G64,
+    I4G64,
+};
+
 /**
  * Non-owning, single-sequence view consumed by growing-cache Ops.
  *
@@ -28,7 +35,8 @@ struct PagedKVLayerView {
     Tensor block_table;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
-    DType dtype               = DType::BF16;
+    // Fork: distinguish packed I4 from its U8 code-plane storage dtype.
+    PagedKVEncoding encoding  = PagedKVEncoding::Bf16;
     std::int32_t quant_group  = 0;
 };
 
@@ -47,7 +55,8 @@ struct PagedKVBatchLayerView {
     Tensor block_tables;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
-    DType dtype               = DType::BF16;
+    // Fork: distinguish packed I4 from its U8 code-plane storage dtype.
+    PagedKVEncoding encoding  = PagedKVEncoding::Bf16;
     std::int32_t quant_group  = 0;
 };
 
