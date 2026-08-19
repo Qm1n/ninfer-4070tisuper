@@ -295,3 +295,19 @@ already sells that trade as its 262k mode).
 Daily-driver command updated:
 ./apps/ninfer .../qwen3_8_27b_minq4.ninfer --kv-dtype int8 --max-context 49152 \
   --kv-capacity 49152 --spec mtp --draft-tokens 3 --prefill-chunk 384
+
+## 13. LAST SPEED ITEMS (2026-08-18)
+
+- --spec dflash: not supported by this target (runtime error). Dead.
+- --lm-head-draft: +3% MTP3 decode (26.4 vs 25.7 tok/s @40k, repeatable), but costs
+  workspace: ceiling 43k vs 49k. Use when speed > window; default stays without.
+- Plain decode @49k: 12.8 tok/s (KV reads grow with context; expect ~-8%/10k tokens).
+
+REMAINING IDEAS, honestly ranked (none are big):
+1. Calibrated Q3-MLP scales (imatrix-style, converter-only): IF it recovers ~half the
+   +0.79 PPL gap → 11.7 GiB → +8% decode. ~1 day + eval; quality-gated, may fail gate.
+2. Fix bf16_gdn_gating_proj cooperative-launch limit → larger prefill chunks (384→1024+);
+   likely small (384/512/1024 all ~375-380).
+3. sm_86 lacks PDL; launch-overlap inside decode rounds is already amortized by CUDA graphs.
+4. KV reads at large ctx are irreducible on-device (paged int8 already).
+Everything else = hardware.
