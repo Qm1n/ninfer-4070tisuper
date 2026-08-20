@@ -361,3 +361,33 @@ RECOMMENDED CONFIGS:
 
 Remaining 128k-MTP3 path (if ever needed): host GDN rewrite checkpoint (-147 MiB) +
 graph-allowance calibration (-82) + G128 (-68) per codex review; acceptance risk remains.
+
+## 16. PHASE 2 SHIPPED — MTP3 AT 120K CONTEXT (2026-08-19/20)
+
+Codex phase-2 (GPU-qualified by me, all 8 test suites green, commit 56575e0):
+- Host-pinned GDN rewrite checkpoints (-146.8 MiB/lane device; D2H capture / H2D restore only)
+- Graph-allowance calibration: startup topology capture, observed+24 MiB, one 48 MiB retry
+- Prefill chunk 64 admitted (-11.5 MiB)
+- i4-G128 KV: --kv-dtype i4 (G128); i4-g64 keeps the old route (-71.3 MiB at 131k)
+- Item 3 (phantom w8_small_t cudaMalloc) was a misdiagnosis — that line is an error check;
+  the calibration capture now warms lazy allocations into the sizing instead.
+- 128k MTP3 still does NOT fit (KV+hot GDN alone exceed free VRAM; -136 MB after all items).
+
+MEASURED CEILINGS AND SPEEDS (minq4 artifact):
+| config | max ctx | decode |
+|---|---|---|
+| MTP3 + i4-G128 | **122,880 (120k)** | **22.4 tok/s** (acceptance 51% on bench prompt) |
+| MTP3 + i4-G64 | 112,640+ (122,880 misses by 7.3 MB) | 21.4 tok/s @100k |
+| MTP3 + int8 | 49,152 | 25.7 tok/s |
+| plain + i4 | 131,072 | 12.6 tok/s |
+
+Headline: 120k @ 22.4 tok/s = +54% over unsloth's 131k @ 14.5 tok/s at near-equal window.
+Acceptance is prompt-dependent (48-67% observed at i4; int8 anchors 64%).
+
+Commands:
+  speed@120k: ./apps/ninfer .../qwen3_8_27b_minq4.ninfer --kv-dtype i4 --max-context 122880 \
+    --kv-capacity 122880 --prefill-chunk 64 --spec mtp --draft-tokens 3
+  speed@49k:  --kv-dtype int8 --max-context 49152 ... --spec mtp --draft-tokens 3
+  plain@128k: --kv-dtype i4 --max-context 131072 --prefill-chunk 384 (no --spec)
+Remaining ideas for MTP@128k: none credible — needs ~136 MB that only weight-size cuts
+(Q3, quality-dead) or KV bits (below 4) could give.
