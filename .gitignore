@@ -46,3 +46,8 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+docs/*.md
+JOURNEY.md
+PROJECT-STATE.md
+SMALLER-WEIGHTS-REVIEW.md
+CONTEXT-128K-REVIEW.md
