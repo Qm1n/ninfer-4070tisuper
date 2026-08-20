@@ -6,6 +6,16 @@ NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwe
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs.
 
+> **Fork note (A5000 / sm_86):** this fork ports the groupwise-int execution paths to any
+> sm_80+ GPU (built and measured on a 16 GB RTX A5000 Laptop, CUDA 12.4), adds new Q4
+> kernels (residual linear_add, Q4/Q4 fused input projections, wide-K GEMV), INT4-G64/G128
+> KV caches, pinned-host tensor placement, and graph-allowance calibration. The nvfp4/fp8
+> profiles remain Blackwell-only (stubbed out below sm_89). It ships a custom min-Q4
+> Qwen3.8-27B artifact tuned for 16 GB cards:
+> **[aaaljaz/qwen3.8-27b-ninfer-minq4](https://huggingface.co/aaaljaz/qwen3.8-27b-ninfer-minq4)**
+> — 131k-token plain context (12.6 tok/s), 122,880 with MTP3 (22.4 tok/s), 49k at 25.7 tok/s.
+> Every change is marked `// Fork:`; upstream 5090 behavior is unchanged.
+
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
 
