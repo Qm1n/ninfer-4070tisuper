@@ -15,7 +15,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::int32_t kv_heads, std::int32_t head_dim,
                               PagedKVEncoding encoding,
                               std::int32_t quant_group, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups) {
+                              std::uint32_t physical_page_groups,
+                              bool allow_repeated_physical_pages) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -23,22 +24,27 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
     // Fork: select code plane geometry from the closed semantic cache encoding.
     if (encoding != PagedKVEncoding::Bf16 && encoding != PagedKVEncoding::I8G64 &&
-        encoding != PagedKVEncoding::I4G64) {
+        encoding != PagedKVEncoding::I4G64 && encoding != PagedKVEncoding::I4G128) {
         throw std::invalid_argument("Paged KV cache encoding is invalid");
     }
     const bool quantized = encoding != PagedKVEncoding::Bf16;
+    // Fork: only the compact I4 encoding admits G128; prior encodings remain fixed at G64.
+    const std::int32_t expected_quant_group =
+        encoding == PagedKVEncoding::I4G128 ? kKvI4Group128 : kKvQuantGroup;
     if ((!quantized && quant_group != 0) ||
-        (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
+        (quantized && (quant_group != expected_quant_group || head_dim % quant_group != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
     const DType code_dtype = encoding == PagedKVEncoding::Bf16
                                  ? DType::BF16
                                  : (encoding == PagedKVEncoding::I8G64 ? DType::I8 : DType::U8);
     const std::int32_t code_extent =
-        encoding == PagedKVEncoding::I4G64 ? head_dim / 2 : head_dim;
+        (encoding == PagedKVEncoding::I4G64 || encoding == PagedKVEncoding::I4G128)
+            ? head_dim / 2
+            : head_dim;
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
+    if (!allow_repeated_physical_pages && physical_page_groups < logical_pages) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
 
@@ -73,11 +79,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_encoding, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups);
+                                spec.kv_table_rows, spec.text_physical_page_groups,
+                                spec.allow_repeated_physical_pages);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_encoding, spec.kv_quant_group,
-                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
+                                   spec.kv_table_rows, spec.mtp_physical_page_groups,
+                                   spec.allow_repeated_physical_pages);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;

@@ -70,32 +70,10 @@ PagedKVEncoding paged_kv_encoding(KvCacheStorage storage) {
         return PagedKVEncoding::I8G64;
     case KvCacheStorage::Int4Group64:
         return PagedKVEncoding::I4G64;
+    case KvCacheStorage::Int4Group128:
+        return PagedKVEncoding::I4G128;
     }
     throw std::invalid_argument("unknown paged KV cache storage");
-}
-
-template <class ProfileAllowance>
-std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
-                                     ProfileAllowance&& profile_allowance, const char* label) {
-    std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-    for (const GraphExecutionProfile profile : profiles) {
-        const std::size_t allowance = profile_allowance(profile);
-        const auto existing = std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-            return entry.first == profile.topology_class;
-        });
-        if (existing == classes.end()) {
-            classes.emplace_back(profile.topology_class, allowance);
-        } else {
-            existing->second = std::max(existing->second, allowance);
-        }
-    }
-
-    std::size_t total = 0;
-    for (const auto& [topology_class, allowance] : classes) {
-        (void)topology_class;
-        total = checked_add(total, allowance, label);
-    }
-    return total;
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -135,6 +113,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     // Fork: only the calibration Program aliases representative logical pages.
+                     .allow_repeated_physical_pages = plan.graph_calibration,
                      .linear_attention =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -557,7 +537,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
-        throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
+        // Fork: 64 is the common native tile across the supported prefill leaves.
+        throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 64");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
@@ -622,7 +603,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
-                                                           std::uint32_t main_page_groups) {
+                                                           std::uint32_t main_page_groups,
+                                                           bool graph_calibration = false) {
     if (main_page_groups == 0) {
         throw std::invalid_argument("Main KV physical page count must be positive");
     }
@@ -640,6 +622,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
+    // Fork: set calibration identity before persistent page planning.
+    impl->graph_calibration   = graph_calibration;
+    // Fork: all topology classes share one empirically calibrated Program-level allowance.
+    impl->graph_allowance_bytes = inputs.graph_allowance_bytes;
     impl->device              = inputs.device;
     // Fork: preserve semantic I4/I8/BF16 encoding through final plan construction.
     impl->kv_encoding         = inputs.kv_encoding;
@@ -652,46 +638,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(merged);
     }
-    if (impl->use_cuda_graph) {
-        // Definitions remain per execution profile, but only one executable is instantiated for
-        // each reachable node-topology class. These bounds cover the largest profile installed in
-        // each class and the driver/module state materialized while qualifying all definitions.
-        if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
-        } else {
-            const auto class_allowance = [&](std::uint32_t batch_size) {
-                const auto profiles =
-                    dflash_graph_profiles(impl->capacity, impl->draft_window, batch_size);
-                return graph_topology_allowance(
-                    profiles,
-                    [&](GraphExecutionProfile profile) {
-                        const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity,
-                            static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
-                    },
-                    "DFlash graph allowance");
-            };
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes =
-                    checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
-                                "DFlash exact-b graph allowance");
-            }
-        }
+    if (!impl->use_cuda_graph && impl->graph_allowance_bytes != 0) {
+        throw std::logic_error("disabled CUDA Graph cannot carry an allowance");
     }
 
     impl->device_reservation_bytes = checked_add(
@@ -700,6 +648,35 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->request_transient_capacity_bytes, "request transient reservation"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
+}
+
+void rebuild_sequence_planner(qwen3_6::detail::SequencePlannerImpl<Variant>& planner) {
+    // Fork: calibrated graph bytes alter only the fixed intercept; rebuild from physical layouts.
+    const std::uint32_t logical_pages = page_count(planner.inputs.capacity);
+    const std::uint32_t minimum_pages = std::max(logical_pages, planner.inputs.max_concurrency);
+    const std::uint64_t maximum_pages64 =
+        static_cast<std::uint64_t>(planner.inputs.max_concurrency) * logical_pages;
+    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("maximum Main KV page count exceeds uint32");
+    }
+    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+
+    planner.minimum = build_sequence_candidate(planner.inputs, minimum_pages);
+    planner.curve   = runtime::SequenceCapacityCurve{
+          .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
+          .minimum_main_page_groups             = minimum_pages,
+          .maximum_main_page_groups             = maximum_pages,
+          .minimum_device_reservation_bytes     = planner.minimum->device_reservation_bytes,
+          .bytes_per_additional_main_page_group = 0,
+    };
+    if (minimum_pages < maximum_pages) {
+        auto adjacent = build_sequence_candidate(planner.inputs, minimum_pages + 1U);
+        if (adjacent->device_reservation_bytes <= planner.minimum->device_reservation_bytes) {
+            throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
+        }
+        planner.curve.bytes_per_additional_main_page_group =
+            adjacent->device_reservation_bytes - planner.minimum->device_reservation_bytes;
+    }
 }
 
 } // namespace
@@ -718,40 +695,43 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .speculative_backend = options.speculative.backend,
         // Fork: packed I4 uses U8 physical planes but remains a distinct semantic encoding.
         .kv_encoding    = paged_kv_encoding(options.kv_cache),
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        // Fork: I4-G128 owns a two-scale plane; all existing encodings retain their group.
+        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16
+                              ? 0
+                              : (options.kv_cache == KvCacheStorage::Int4Group128
+                                     ? qwen3_6::kKvI4Group128
+                                     : qwen3_6::kKvQuantGroup),
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,
+        // Fork: provisional observed-zero allowance permits the minimal startup calibration.
+        .graph_allowance_bytes = options.use_cuda_graph ? 24ULL * kMiB : 0,
     };
-    const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const std::uint64_t maximum_pages64 =
-        static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
-    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("maximum Main KV page count exceeds uint32");
-    }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
-
-    auto planner     = std::make_unique<qwen3_6::detail::SequencePlannerImpl<Variant>>();
-    planner->inputs  = inputs;
-    planner->minimum = build_sequence_candidate(inputs, minimum_pages);
-    planner->curve   = runtime::SequenceCapacityCurve{
-          .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
-          .minimum_main_page_groups             = minimum_pages,
-          .maximum_main_page_groups             = maximum_pages,
-          .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
-          .bytes_per_additional_main_page_group = 0,
-    };
-    if (minimum_pages < maximum_pages) {
-        auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
-        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
-            throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
-        }
-        planner->curve.bytes_per_additional_main_page_group =
-            adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
-    }
+    auto planner    = std::make_unique<qwen3_6::detail::SequencePlannerImpl<Variant>>();
+    planner->inputs = inputs;
+    rebuild_sequence_planner(*planner);
     return planner;
+}
+
+std::unique_ptr<SequencePlanImpl> make_graph_calibration_plan_impl(
+    const qwen3_6::detail::SequencePlannerImpl<Variant>& planner) {
+    if (!planner.inputs.use_cuda_graph) {
+        throw std::logic_error("CUDA Graph calibration requested with graphs disabled");
+    }
+    // Fork: one private physical page per lane is sufficient for every representative definition.
+    auto plan = build_sequence_candidate(planner.inputs, planner.inputs.max_concurrency, true);
+    return plan;
+}
+
+void set_graph_allowance_impl(qwen3_6::detail::SequencePlannerImpl<Variant>& planner,
+                              std::size_t allowance_bytes) {
+    if (!planner.inputs.use_cuda_graph || allowance_bytes == 0) {
+        throw std::invalid_argument("calibrated CUDA Graph allowance must be positive");
+    }
+    // Fork: applying calibration regenerates all reservation values from the same layout authority.
+    planner.inputs.graph_allowance_bytes = allowance_bytes;
+    rebuild_sequence_planner(planner);
 }
 
 std::unique_ptr<SequencePlanImpl>

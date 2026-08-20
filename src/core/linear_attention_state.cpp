@@ -193,6 +193,57 @@ Tensor LinearAttentionStatePool::recurrent_slot(std::uint32_t layer, std::int32_
         .view({spec.key_head_dim, spec.value_head_dim, spec.value_heads});
 }
 
+// Fork: host rewrite checkpoints pack every convolution image followed by every recurrent image.
+std::size_t LinearAttentionStatePool::slot_image_bytes() const noexcept {
+    if (conv.empty() || recurrent.empty()) { return 0; }
+    return conv_slot(0, 0).bytes() * conv.size() + recurrent_slot(0, 0).bytes() * recurrent.size();
+}
+
+void LinearAttentionStatePool::copy_slot_to_host(std::int32_t src, void* host,
+                                                  std::size_t host_bytes,
+                                                  cudaStream_t stream) const {
+    validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot_to_host source");
+    if (host == nullptr || host_bytes != slot_image_bytes()) {
+        throw std::invalid_argument(
+            "LinearAttentionStatePool copy_slot_to_host image size is inconsistent");
+    }
+    auto* cursor = static_cast<unsigned char*>(host);
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor source = conv_slot(layer, src);
+        CUDA_CHECK(cudaMemcpyAsync(cursor, source.data, source.bytes(), cudaMemcpyDeviceToHost,
+                                   stream));
+        cursor += source.bytes();
+    }
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor source = recurrent_slot(layer, src);
+        CUDA_CHECK(cudaMemcpyAsync(cursor, source.data, source.bytes(), cudaMemcpyDeviceToHost,
+                                   stream));
+        cursor += source.bytes();
+    }
+}
+
+void LinearAttentionStatePool::copy_slot_from_host(const void* host, std::size_t host_bytes,
+                                                    std::int32_t dst, cudaStream_t stream) {
+    validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot_from_host destination");
+    if (host == nullptr || host_bytes != slot_image_bytes()) {
+        throw std::invalid_argument(
+            "LinearAttentionStatePool copy_slot_from_host image size is inconsistent");
+    }
+    const auto* cursor = static_cast<const unsigned char*>(host);
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor destination = conv_slot(layer, dst);
+        CUDA_CHECK(cudaMemcpyAsync(destination.data, cursor, destination.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        cursor += destination.bytes();
+    }
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor destination = recurrent_slot(layer, dst);
+        CUDA_CHECK(cudaMemcpyAsync(destination.data, cursor, destination.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        cursor += destination.bytes();
+    }
+}
+
 void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
     validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot source");
     validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot destination");

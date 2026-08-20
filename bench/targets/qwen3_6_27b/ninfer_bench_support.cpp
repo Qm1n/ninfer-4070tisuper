@@ -51,9 +51,10 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    // Fork: benchmark the same native I4-G64 product route as CLI and serving.
-    if (text == "i4") { return KvCacheStorage::Int4Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, or i4");
+    // Fork: match product selection while retaining an explicit G64 benchmark route.
+    if (text == "i4") { return KvCacheStorage::Int4Group128; }
+    if (text == "i4-g64") { return KvCacheStorage::Int4Group64; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, i4, or i4-g64");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -272,8 +273,8 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        // Fork: advertise native I4-G64 benchmark selection.
-        << "  --kv-dtype <bf16|int8|i4>   KV cache storage (default: bf16)\n"
+        // Fork: advertise I4-G128 plus the retained explicit I4-G64 benchmark selection.
+        << "  --kv-dtype <bf16|int8|i4|i4-g64> KV cache storage (default: bf16)\n"
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -359,7 +360,8 @@ BenchOptions parse_args(int argc, char** argv) {
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+        // Fork: benchmark validation follows the Engine's 64-token tile contract.
+        throw std::invalid_argument("--prefill-chunk must be a multiple of 64");
     }
     if (options.proposal_head == ProposalHead::Optimized && options.mtp_draft_tokens == 0) {
         throw std::invalid_argument(
@@ -669,7 +671,12 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
         << "    \"cuda_graph_observed_bytes\": " << env.memory.cuda_graph_observed_bytes << ",\n"
-        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
+        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << ",\n"
+        // Fork: retain host/device GDN decomposition in machine-readable benchmark output.
+        << "    \"gdn_state_device_hot_bytes\": "
+        << env.memory.gdn_state_device_hot_bytes << ",\n"
+        << "    \"gdn_state_host_checkpoint_bytes\": "
+        << env.memory.gdn_state_host_checkpoint_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
@@ -826,6 +833,9 @@ std::string kv_cache_name(KvCacheStorage storage) {
     // Fork: retain the exact cache format in benchmark reports.
     case KvCacheStorage::Int4Group64:
         return "int4-group64";
+    case KvCacheStorage::Int4Group128:
+        // Fork: retain the physical group in benchmark reports.
+        return "int4-group128";
     }
     return "unknown";
 }

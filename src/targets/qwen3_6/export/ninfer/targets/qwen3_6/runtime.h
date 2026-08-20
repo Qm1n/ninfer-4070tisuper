@@ -61,6 +61,8 @@ public:
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
+    // Fork: expose the dry-run physical decomposition before any device allocation.
+    [[nodiscard]] MemorySummary planned_memory_summary() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
@@ -84,6 +86,9 @@ public:
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    // Fork: calibrate graphs on a minimal physical KV pool before final capacity resolution.
+    [[nodiscard]] SequencePlan<Variant> graph_calibration_plan() const;
+    void set_graph_allowance(std::size_t allowance_bytes);
     [[nodiscard]] SequencePlan<Variant> finalize(std::uint32_t main_page_groups) &&;
 
 public:

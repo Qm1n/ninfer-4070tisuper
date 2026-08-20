@@ -49,8 +49,9 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    // Fork: expose native signed-nibble G64 paged KV storage.
-    if (value == "i4") { return KvCacheStorage::Int4Group64; }
+    // Fork: the largest-context selector uses G128; the bit-identical G64 route stays explicit.
+    if (value == "i4") { return KvCacheStorage::Int4Group128; }
+    if (value == "i4-g64") { return KvCacheStorage::Int4Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -73,8 +74,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           // Fork: advertise the native I4-G64 cache route.
-           "[--kv-dtype bf16|int8|i4] [--spec mtp|dflash --draft-tokens N] "
+           // Fork: advertise I4-G128 plus the retained explicit I4-G64 route.
+           "[--kv-dtype bf16|int8|i4|i4-g64] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -287,8 +288,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    // Fork: serving shares the Engine's 64-token minimum prefill tile.
+    if (options.prefill_chunk == 0 || options.prefill_chunk % 64 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 64");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {

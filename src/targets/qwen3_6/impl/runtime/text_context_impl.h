@@ -234,20 +234,25 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
-    set_linear_state_slots(0, state_.slot_count() > 1 ? 1 : 0);
+    // Fork: TextContext defaults to the first hot lane; checkpoint storage is configured by prefill.
+    set_linear_state_slot(0);
     bind();
 }
 
 TextContext::~TextContext() = default;
 
-void TextContext::set_linear_state_slots(std::int32_t current_slot,
-                                         std::int32_t rewrite_checkpoint_slot) {
-    if (current_slot < 0 || current_slot >= state_.slot_count() || rewrite_checkpoint_slot < 0 ||
-        rewrite_checkpoint_slot >= state_.slot_count() || current_slot == rewrite_checkpoint_slot) {
-        throw std::invalid_argument("TextContext Linear Attention slots are invalid");
+void TextContext::set_linear_state_slot(std::int32_t current_slot) {
+    if (current_slot < 0 || current_slot >= state_.slot_count()) {
+        throw std::invalid_argument("TextContext Linear Attention slot is invalid");
     }
-    linear_state_current_slot_            = current_slot;
-    linear_state_rewrite_checkpoint_slot_ = rewrite_checkpoint_slot;
+    linear_state_current_slot_ = current_slot;
+}
+
+void TextContext::set_rewrite_checkpoint_linear_state_output(void* host,
+                                                              std::size_t host_bytes) noexcept {
+    // Fork: the Program owns this lane-stable pinned allocation for TextContext's lifetime.
+    rewrite_checkpoint_linear_state_output_ = host;
+    rewrite_checkpoint_linear_state_bytes_  = host_bytes;
 }
 
 void TextContext::set_gdn_state_action(GdnStateAction action,
@@ -1069,7 +1074,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         checkpoint_abs > base64 && checkpoint_abs <= base64 + static_cast<std::int64_t>(T);
     const int checkpoint_rel =
         has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
-    const std::int32_t rewrite_checkpoint_slot = linear_state_rewrite_checkpoint_slot_;
 
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
@@ -1282,7 +1286,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         }
 
         if (checkpoint_rel > 0 && t0 + len == checkpoint_rel) {
-            state_.copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot, s);
+            // Fork: prompt-checkpoint capture is the only D2H GDN-state transfer.
+            state_.copy_slot_to_host(linear_state_current_slot_,
+                                     rewrite_checkpoint_linear_state_output_,
+                                     rewrite_checkpoint_linear_state_bytes_, s);
         }
 
         t0 += len;

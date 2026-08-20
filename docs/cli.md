@@ -133,15 +133,15 @@ measured recommendation rather than a semantic limit.
 
 ## Common options
 
-<!-- // Fork: common options include native packed I4-G64 cache storage. -->
+<!-- // Fork: common options include native packed I4-G128 and explicit I4-G64 storage. -->
 | Option | Meaning | Default |
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
+| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 64 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|i4` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|i4\|i4-g64` | KV-cache storage; `i4` selects G128 | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -184,9 +184,9 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 The registered model IDs have a native context limit of 262,144 tokens. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-<!-- // Fork: I4 halves code-plane traffic and capacity relative to INT8-G64. -->
-Use `--kv-dtype i4` for the largest context allocations, or `int8` for the existing quantized
-profile. The prepared prompt must fit
+<!-- // Fork: I4-G128 halves code traffic and halves scale rows relative to I4-G64. -->
+Use `--kv-dtype i4` (I4-G128) for the largest context allocations, `i4-g64` for the prior
+four-scale packed route, or `int8` for the existing quantized profile. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
@@ -204,6 +204,11 @@ Vision phases, not their sum. Its prefill bound uses
 `min(--prefill-chunk,--max-context)`. The request-transient buffer is also frozen at startup; a
 media request activates only the needed prefix and performs no project-owned device allocation or
 growth.
+
+<!-- // Fork: byte-exact startup telemetry supports long-context capacity qualification. -->
+Set `NINFER_MEMORY_VERBOSE=1` to print `MemorySummary` immediately after load, including sequence
+and workspace capacities, KV payload/encoding, device-hot and pinned-host GDN state, Graph
+allowance/observed bytes, and free VRAM after weights and after complete startup.
 
 All weight, sequence, workspace, request-transient, and graph allocations are released when the
 Engine is destroyed.

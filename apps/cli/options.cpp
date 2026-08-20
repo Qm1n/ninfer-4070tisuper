@@ -55,8 +55,9 @@ float parse_float(const char* text, std::string_view label, float minimum, float
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    // Fork: expose native signed-nibble G64 paged KV storage.
-    if (text == "i4") { return KvCacheStorage::Int4Group64; }
+    // Fork: the largest-context selector uses G128; the bit-identical G64 route stays explicit.
+    if (text == "i4") { return KvCacheStorage::Int4Group128; }
+    if (text == "i4-g64") { return KvCacheStorage::Int4Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -79,8 +80,8 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           // Fork: advertise the native I4-G64 cache route.
-           "       [--kv-dtype bf16|int8|i4] [--spec mtp|dflash --draft-tokens N]\n"
+           // Fork: advertise I4-G128 plus the retained explicit I4-G64 route.
+           "       [--kv-dtype bf16|int8|i4|i4-g64] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -203,8 +204,9 @@ Options parse_options(int argc, char** argv) {
     if (has_prompt == has_messages) {
         throw std::invalid_argument("pass exactly one of --prompt or --messages");
     }
-    if (options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    // Fork: expose the 64-token memory profile through the product CLI.
+    if (options.prefill_chunk == 0 || options.prefill_chunk % 64 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 64");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {

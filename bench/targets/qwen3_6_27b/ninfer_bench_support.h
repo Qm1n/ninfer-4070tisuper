@@ -24,7 +24,8 @@ inline constexpr int kDefaultNGen                     = 128;
 inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
-inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+// Fork: benchmark the same 64-token prefill profile exposed by Engine.
+inline constexpr std::uint32_t kPrefillChunkAlignment = 64;
 inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };

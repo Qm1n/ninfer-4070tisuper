@@ -28,6 +28,8 @@ enum class KvCacheStorage : std::uint8_t {
     Int8Group64,
     // Fork: native signed-nibble paged KV storage with one FP16 scale per 64 values.
     Int4Group64,
+    // Fork: signed-nibble paged KV storage with one FP16 scale per 128 values.
+    Int4Group128,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -434,6 +436,9 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // Fork: distinguish hot device GDN state from cold pinned-host rewrite checkpoints.
+    std::size_t gdn_state_device_hot_bytes        = 0;
+    std::size_t gdn_state_host_checkpoint_bytes   = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive

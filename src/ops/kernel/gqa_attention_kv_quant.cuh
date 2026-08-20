@@ -21,7 +21,10 @@ namespace ninfer::ops {
 inline constexpr int kGqaKvQuantHeadDim = 256;
 inline constexpr int kGqaKvQuantGroup   = 64;
 inline constexpr int kGqaKvQuantGroups  = kGqaKvQuantHeadDim / kGqaKvQuantGroup;
-// Fork: signed I4-G64 stores two logical dimensions in each U8 code byte.
+// Fork: I4-G128 stores two scale elements per token/head while retaining the code geometry.
+inline constexpr int kGqaKvI4G128Group  = 128;
+inline constexpr int kGqaKvI4G128Groups = kGqaKvQuantHeadDim / kGqaKvI4G128Group;
+// Fork: both signed I4 group sizes store two logical dimensions in each U8 code byte.
 inline constexpr int kGqaKvI4CodeHeadDim = kGqaKvQuantHeadDim / 2;
 
 template <typename Geometry>
@@ -44,6 +47,14 @@ __device__ __forceinline__ std::int64_t gqa_kv_quant_scale_index(int physical_pa
                                                                  int group, int page_offset) {
     return paged_kv_element_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page, kv_head,
                                                                          page_offset, group);
+}
+
+// Fork: compact scale-plane address used only by the I4-G128 specialization.
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t gqa_kv_i4_g128_scale_index(
+    int physical_page, int kv_head, int group, int page_offset) {
+    return paged_kv_element_offset<kGqaKvI4G128Groups, Geometry::KVHeads>(
+        physical_page, kv_head, page_offset, group);
 }
 
 template <typename Geometry>

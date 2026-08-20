@@ -55,6 +55,44 @@ std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noex
 }
 
 template <>
+MemorySummary SequencePlan<Variant>::planned_memory_summary() const noexcept {
+    MemorySummary out;
+    if (impl_ == nullptr) { return out; }
+    out.device      = impl_->device;
+    out.max_context = impl_->capacity;
+    out.kv_capacity = impl_->kv_capacity;
+    // Fork: planned telemetry retains semantic encoding independently from code-plane dtype.
+    switch (impl_->kv_encoding) {
+    case PagedKVEncoding::Bf16:
+        out.kv_cache = KvCacheStorage::BFloat16;
+        break;
+    case PagedKVEncoding::I8G64:
+        out.kv_cache = KvCacheStorage::Int8Group64;
+        break;
+    case PagedKVEncoding::I4G64:
+        out.kv_cache = KvCacheStorage::Int4Group64;
+        break;
+    case PagedKVEncoding::I4G128:
+        out.kv_cache = KvCacheStorage::Int4Group128;
+        break;
+    }
+    out.sequence.capacity_bytes          = impl_->persistent.bytes;
+    out.workspace.capacity_bytes         = impl_->workspace.capacity;
+    out.request_transient.capacity_bytes = impl_->request_transient_capacity_bytes;
+    out.cuda_graph_allowance_bytes       = impl_->graph_allowance_bytes;
+    out.kv_payload_bytes                 = impl_->persistent.kv_payload_bytes;
+    // Fork: region payload sum is the exact hot-state allocation and one host image per lane.
+    for (const LayoutRegion& region : impl_->persistent.decoder.linear_attention.conv) {
+        out.gdn_state_device_hot_bytes += region.bytes;
+    }
+    for (const LayoutRegion& region : impl_->persistent.decoder.linear_attention.recurrent) {
+        out.gdn_state_device_hot_bytes += region.bytes;
+    }
+    out.gdn_state_host_checkpoint_bytes = out.gdn_state_device_hot_bytes;
+    return out;
+}
+
+template <>
 SequencePlanner<Variant>::SequencePlanner(
     std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -70,6 +108,21 @@ template <>
 const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
     static const runtime::SequenceCapacityCurve empty;
     return impl_ != nullptr ? impl_->curve : empty;
+}
+
+template <>
+SequencePlan<Variant> SequencePlanner<Variant>::graph_calibration_plan() const {
+    if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
+    // Fork: calibration preserves the planner for the observed-allowance rebuild.
+    return SequencePlan<Variant>(
+        detail::NINFER_QWEN36_RUNTIME_NS::make_graph_calibration_plan_impl(*impl_));
+}
+
+template <>
+void SequencePlanner<Variant>::set_graph_allowance(std::size_t allowance_bytes) {
+    if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
+    // Fork: rebuild the complete affine curve from the calibrated fixed intercept.
+    detail::NINFER_QWEN36_RUNTIME_NS::set_graph_allowance_impl(*impl_, allowance_bytes);
 }
 
 template <>

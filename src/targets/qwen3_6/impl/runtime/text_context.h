@@ -70,7 +70,8 @@ struct ModelConfig {
 
 inline constexpr ModelConfig kCfg{};
 inline constexpr float kAttnScale                     = kAttentionScale;
-inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+// Fork: the family schedule admits the common GQA/GDN 64-token tile.
+inline constexpr std::uint32_t kPrefillChunkAlignment = 64;
 
 struct MlpW {
     const MlpWeights* payload = nullptr;
@@ -181,7 +182,9 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
-    void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
+    // Fork: the hot slot stays device-resident while checkpoint capture writes pinned host memory.
+    void set_linear_state_slot(std::int32_t current_slot);
+    void set_rewrite_checkpoint_linear_state_output(void* host, std::size_t host_bytes) noexcept;
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
@@ -305,7 +308,9 @@ private:
     std::int32_t active_sequence_width_                   = 0;
     std::int32_t rope_delta_                              = 0;
     std::int32_t linear_state_current_slot_               = 0;
-    std::int32_t linear_state_rewrite_checkpoint_slot_    = 0;
+    // Fork: checkpoint copies are outside the steady-state decode path.
+    void* rewrite_checkpoint_linear_state_output_         = nullptr;
+    std::size_t rewrite_checkpoint_linear_state_bytes_    = 0;
     GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_               = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;

@@ -66,13 +66,15 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    // Fork: semantic paged-KV encoding, including packed I4-G64.
+    // Fork: semantic paged-KV encoding, including both packed I4 group sizes.
     PagedKVEncoding kv_encoding             = PagedKVEncoding::Bf16;
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
+    // Fork: the provisional startup value is replaced by observed graph bytes plus margin.
+    std::size_t graph_allowance_bytes = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -89,12 +91,14 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    // Fork: semantic paged-KV encoding, including packed I4-G64.
+    // Fork: semantic paged-KV encoding, including both packed I4 group sizes.
     PagedKVEncoding kv_encoding             = PagedKVEncoding::Bf16;
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    // Fork: calibration Programs exercise graph topology with only capture-row KV payload.
+    bool graph_calibration = false;
     int device          = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
@@ -119,6 +123,13 @@ using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 [[nodiscard]] std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile);
+
+// Fork: startup graph calibration mutates only the planner's fixed reservation intercept.
+[[nodiscard]] std::unique_ptr<SequencePlanImpl>
+make_graph_calibration_plan_impl(
+    const qwen3_6::detail::SequencePlannerImpl<Variant>& planner);
+void set_graph_allowance_impl(qwen3_6::detail::SequencePlannerImpl<Variant>& planner,
+                              std::size_t allowance_bytes);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>> planner,
                             std::uint32_t main_page_groups);

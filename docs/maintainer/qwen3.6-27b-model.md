@@ -145,8 +145,10 @@ a = a * sigmoid(gate)
 x = x + o_projection(a)
 ```
 
+<!-- // Fork: registered causal cache encodings include both packed I4 group sizes. -->
 Prefill appends all K/V columns and evaluates causal attention for the chunk. Decode appends one
-column and attends over the resident prefix. KV storage may be BF16 or INT8-G64. The exact runtime
+column and attends over the resident prefix. KV storage may be BF16, INT8-G64, I4-G64, or I4-G128.
+The exact runtime
 cache codec and the common ideal attention oracle are defined by the repository-internal
 [`gqa_attention.h`](../../include/ninfer/ops/gqa_attention.h) contract. Both cache formats and their
 optimized compute profiles are judged by that one oracle construction rather than by
@@ -382,8 +384,12 @@ remain consistent.
 - the ideal GQA oracle evaluates dot products, stable softmax, and value reduction in FP64 from
   BF16 Q and logical cache values; the BF16 Op output is promoted to FP64 for comparison;
 - low-bit weight storage changes representation, not the intended dequantized matrix;
+<!-- // Fork: both packed I4 codecs have direct exact-codec and FP64-attention oracles. -->
 - INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
   decode;
+- I4-G64/I4-G128 KV stores signed nibbles in low-even/high-odd order with one FP16 scale per
+  64/128 values; each route is checked against its exact codec oracle and the common FP64 attention
+  oracle;
 - the target's INT8 attention path intentionally quantizes Q to Q8-G64 for production computation;
   this native compute profile does not replace BF16 Q in the common ideal oracle, and its delta is
   accepted through the separate named INT8-cache compute-profile criterion;

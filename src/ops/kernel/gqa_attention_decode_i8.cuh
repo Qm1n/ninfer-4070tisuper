@@ -57,7 +57,7 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
           bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput,
-          typename CacheCode>
+          typename CacheCode, int CacheQuantGroup>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheCode* cache_k_codes,
@@ -87,6 +87,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     // Fork: unsigned code elements select the packed signed-nibble storage route.
     constexpr bool I4             = std::is_same_v<CacheCode, std::uint8_t>;
+    // Fork: cached G128 scales expand to the four G64 arithmetic lanes after load.
+    constexpr int CacheGroups     = D / CacheQuantGroup;
     constexpr float Log2E         = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
 
@@ -97,6 +99,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
     static_assert(I4 || std::is_same_v<CacheCode, std::int8_t>);
+    static_assert(CacheQuantGroup == kGqaKvQuantGroup ||
+                  CacheQuantGroup == kGqaKvI4G128Group);
+    static_assert(I4 || CacheQuantGroup == kGqaKvQuantGroup);
 
     // Keep Q in a compact dedicated tile so the producer can reload one
     // 64-dimension group at a time instead of carrying all eight fragments in
@@ -216,6 +221,63 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     if constexpr (CacheInput::writes_cache) {
         // The owning split quantizes each current row before its cache tile is consumed.
+        if constexpr (I4 && CacheQuantGroup == kGqaKvI4G128Group) {
+            // Fork: one warp reduces all 128 values and emits two 32-byte packed halves.
+            for (int pair = warp; pair < valid_tokens * CacheGroups; pair += Wc) {
+                const int token    = pair / CacheGroups;
+                const int grp      = pair - token * CacheGroups;
+                const int position = pos[token];
+                if (position < split_start || position >= split_end) { continue; }
+                int physical_page =
+                    lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+                const int page_offset = position & kPagedKVPageMask;
+                const int d0          = grp * CacheQuantGroup + 2 * lane;
+                const int d1          = d0 + 1;
+                const int d2          = d0 + 64;
+                const int d3          = d1 + 64;
+                const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
+                const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
+                const std::int64_t src2 = gqa_kv_new_index<Geometry>(kv_head, d2, token);
+                const std::int64_t src3 = gqa_kv_new_index<Geometry>(kv_head, d3, token);
+                const float kv0         = __bfloat162float(input.k[src0]);
+                const float kv1         = __bfloat162float(input.k[src1]);
+                const float kv2         = __bfloat162float(input.k[src2]);
+                const float kv3         = __bfloat162float(input.k[src3]);
+                const float vv0         = __bfloat162float(input.v[src0]);
+                const float vv1         = __bfloat162float(input.v[src1]);
+                const float vv2         = __bfloat162float(input.v[src2]);
+                const float vv3         = __bfloat162float(input.v[src3]);
+                float kamax = fmaxf(fmaxf(fabsf(kv0), fabsf(kv1)),
+                                    fmaxf(fabsf(kv2), fabsf(kv3)));
+                float vamax = fmaxf(fmaxf(fabsf(vv0), fabsf(vv1)),
+                                    fmaxf(fabsf(vv2), fabsf(vv3)));
+                kamax = warp_max(kamax, FullMask);
+                vamax = warp_max(vamax, FullMask);
+                const __half ksh = __float2half_rn(kamax > 0.0f ? kamax / 7.0f : 0.0f);
+                const __half vsh = __float2half_rn(vamax > 0.0f ? vamax / 7.0f : 0.0f);
+                const float ks   = __half2float(ksh);
+                const float vs   = __half2float(vsh);
+                const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
+                const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
+                physical_page    = __shfl_sync(FullMask, physical_page, 0);
+                const std::int64_t co = gqa_kv_quant_i4_code_index<Geometry>(
+                    physical_page, kv_head, d0 / 2, page_offset);
+                cache_k_codes[co] = gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(kv0, kinv),
+                                                        gqa_kv_quant_i4_code(kv1, kinv));
+                cache_v_codes[co] = gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(vv0, vinv),
+                                                        gqa_kv_quant_i4_code(vv1, vinv));
+                cache_k_codes[co + 32] = gqa_kv_pack_i4_pair(
+                    gqa_kv_quant_i4_code(kv2, kinv), gqa_kv_quant_i4_code(kv3, kinv));
+                cache_v_codes[co + 32] = gqa_kv_pack_i4_pair(
+                    gqa_kv_quant_i4_code(vv2, vinv), gqa_kv_quant_i4_code(vv3, vinv));
+                if (lane == 0) {
+                    const std::int64_t so = gqa_kv_i4_g128_scale_index<Geometry>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so] = ksh;
+                    cache_v_scale[so] = vsh;
+                }
+            }
+        } else {
         for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
@@ -271,6 +333,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 cache_k_scale[so] = ksh;
                 cache_v_scale[so] = vsh;
             }
+        }
         }
         __syncthreads();
     }
@@ -341,10 +404,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = gqa_kv_quant_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
+                if constexpr (CacheQuantGroup == kGqaKvI4G128Group) {
+                    const std::int64_t off = gqa_kv_i4_g128_scale_index<Geometry>(
+                        physical_page, kv_head, 0, key & kPagedKVPageMask);
+                    const __half ks0 = cache_k_scale[off];
+                    const __half ks1 = cache_k_scale[off + 1];
+                    const __half vs0 = cache_v_scale[off];
+                    const __half vs1 = cache_v_scale[off + 1];
+                    k_scale_s[key_l * Groups + 0] = ks0;
+                    k_scale_s[key_l * Groups + 1] = ks0;
+                    k_scale_s[key_l * Groups + 2] = ks1;
+                    k_scale_s[key_l * Groups + 3] = ks1;
+                    v_scale_s[key_l * Groups + 0] = vs0;
+                    v_scale_s[key_l * Groups + 1] = vs0;
+                    v_scale_s[key_l * Groups + 2] = vs1;
+                    v_scale_s[key_l * Groups + 3] = vs1;
+                } else {
+                    const std::int64_t off = gqa_kv_quant_scale_index<Geometry>(
+                        physical_page, kv_head, 0, key & kPagedKVPageMask);
+                    ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
+                    ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
+                }
             } else {
                 store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
                 store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));

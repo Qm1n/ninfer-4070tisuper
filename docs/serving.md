@@ -449,7 +449,7 @@ curl http://127.0.0.1:8080/v1/models \
 
 ## Server options
 
-<!-- // Fork: server options include native packed I4-G64 cache storage. -->
+<!-- // Fork: server options use I4-G128 for `i4` and retain I4-G64 explicitly. -->
 | Option | Meaning | Default |
 |---|---|---:|
 | `--host H` | listen address | `127.0.0.1` |
@@ -471,7 +471,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|i4` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|i4\|i4-g64` | KV-cache storage; `i4` selects G128 | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |

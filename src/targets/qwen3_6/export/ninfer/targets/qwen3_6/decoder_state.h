@@ -11,6 +11,8 @@
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
+// Fork: the compact I4 variant halves scale-plane storage without changing code planes.
+inline constexpr std::int32_t kKvI4Group128 = 128;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
@@ -25,6 +27,8 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    // Fork: graph calibration intentionally aliases logical rows onto one page per lane.
+    bool allow_repeated_physical_pages       = false;
     LinearAttentionStatePoolSpec linear_attention;
 };
 

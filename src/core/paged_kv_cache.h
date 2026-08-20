@@ -19,6 +19,8 @@ enum class PagedKVEncoding : std::uint8_t {
     Bf16,
     I8G64,
     I4G64,
+    // Fork: codes retain the I4 layout while scale planes contain two groups per head.
+    I4G128,
 };
 
 /**

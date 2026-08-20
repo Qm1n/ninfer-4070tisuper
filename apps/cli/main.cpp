@@ -101,6 +101,9 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "int8-group64";
     case ninfer::KvCacheStorage::Int4Group64:
         return "int4-group64";
+    case ninfer::KvCacheStorage::Int4Group128:
+        // Fork: distinguish the compact scale-plane encoding in CLI telemetry.
+        return "int4-group128";
     }
     return "unknown";
 }
@@ -198,6 +201,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    // Fork: distinguish the hot device state from the cold pinned-host checkpoint.
+    print_metric("GDN device hot state", format_bytes(memory.gdn_state_device_hot_bytes));
+    print_metric("GDN host checkpoint", format_bytes(memory.gdn_state_host_checkpoint_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));

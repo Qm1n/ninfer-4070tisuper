@@ -114,7 +114,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
 }
 
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput,
-          typename CacheCode>
+          typename CacheCode, int CacheQuantGroup>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -132,13 +132,14 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                     MultiBatch, Masked, CacheInput, CacheCode>,
+                                                     MultiBatch, Masked, CacheInput, CacheCode,
+                                                     CacheQuantGroup>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                              KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput,
-                                             CacheCode>
+                                             CacheCode, CacheQuantGroup>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data),
@@ -229,7 +230,8 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
     // Fork: all three closed encodings are valid split-policy profiles.
     if ((cache_encoding != PagedKVEncoding::Bf16 &&
          cache_encoding != PagedKVEncoding::I8G64 &&
-         cache_encoding != PagedKVEncoding::I4G64) ||
+         cache_encoding != PagedKVEncoding::I4G64 &&
+         cache_encoding != PagedKVEncoding::I4G128) ||
         tokens < 1 || tokens > 6 ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
@@ -262,12 +264,18 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.encoding == PagedKVEncoding::I8G64) {                                      \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, CacheInput,           \
-                                     std::int8_t>(                                                 \
+                                     std::int8_t, kGqaKvQuantGroup>(                                \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else if (cache.encoding == PagedKVEncoding::I4G64) {                                \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, CacheInput,           \
-                                     std::uint8_t>(                                                \
+                                     std::uint8_t, kGqaKvQuantGroup>(                               \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.encoding == PagedKVEncoding::I4G128) {                               \
+                /* Fork: G128 shares code traffic and expands its two physical scales on-chip. */  \
+                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, CacheInput,           \
+                                     std::uint8_t, kGqaKvI4G128Group>(                              \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else {                                                                               \

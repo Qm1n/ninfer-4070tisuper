@@ -20,10 +20,10 @@ struct GqaExecutionEnvelope {
 /**
  * Shared numerical contract for A1/A2/A3.
  *
- * // Fork: add native packed I4-G64 to the shared numerical contract.
+ * // Fork: add native packed I4-G64/I4-G128 to the shared numerical contract.
  * Public q/k/v inputs and BF16 cache values are interpreted after their BF16 storage boundary.
- * INT8-G64 and I4-G64 cache rows use one FP16 scale for each contiguous 64-element group. For
- * BF16 source values x, their exact observable encoding is:
+ * INT8-G64 and I4-G64 cache rows use one FP16 scale per contiguous 64-element group; I4-G128 uses
+ * one per contiguous 128-element group. For BF16 source values x, their exact encoding is:
  *
  *   a          = max_i abs(FP32(x[i]))
  *   scale_bits = FP16_RNE(a / M), M = 127 for INT8 and 7 for I4
@@ -35,15 +35,17 @@ struct GqaExecutionEnvelope {
  * I4 stores the even logical dimension in the low signed nibble and the following odd dimension
  * in the high signed nibble. A1 and A2 produce identical code and scale bits. The common ideal
  * attention oracle uses BF16 Q and logical cache values (BF16 values for a BF16 cache, FP32 decode
- * above for INT8-G64 or I4-G64), then evaluates score dot products, stable softmax, and value
- * reduction in FP64. The BF16 Op output is promoted to FP64 for comparison with that result.
+ * above for INT8-G64, I4-G64, or I4-G128), then evaluates score dot products, stable softmax,
+ * and value reduction in FP64. The BF16 Op output is promoted to FP64 for comparison with that
+ * result.
  *
  * The registered quantized implementations define Q8-G64, paired with INT8-G64 or unpacked
- * I4-G64 K, as their native query compute profile. Their profile-defined query quantization and
- * any narrower staging do not replace BF16 Q in the ideal oracle. Each cache compute profile has a
- * separate named numerical criterion owned by the GQA conformance test. Those envelopes apply to
- * the registered geometries, tested token extents, conformance matrix, and target-representative
- * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
+ * I4-G64/I4-G128 K, as their native query compute profile. Their profile-defined query
+ * quantization and any narrower staging do not replace BF16 Q in the ideal oracle. Each cache
+ * compute profile has a separate named numerical criterion owned by the GQA conformance test.
+ * Those envelopes apply to the registered geometries, tested token extents, conformance matrix,
+ * and target-representative activation range; they are not a universal error bound for arbitrary
+ * adversarial BF16 tensors.
  * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
  * additional consistency check.
  */
@@ -75,7 +77,7 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, PagedKVEncoding cac
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
  * call topology; it is not inferred by copying device metadata to the host. B=1 accepts every
  * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16
- * or INT8-G64 or I4-G64 under the shared numerical contract above. // Fork: I4 is first-class.
+ * or INT8-G64, I4-G64, or I4-G128 under the shared numerical contract above. // Fork: I4 is first-class.
  * PagedKVBatchLayerView supplies shared planes and the complete block-table matrix;
  * kv_table_rows[b] selects one row for sequence b.
  *
@@ -100,7 +102,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
  * contiguous sequential I32 [T], and every addressed quantized code and scale is overwritten. It
  * reads no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
- * // Fork: A2 covers both I8-G64 and packed I4-G64.
+ * // Fork: A2 covers I8-G64 and both packed I4 group sizes.
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                    PagedKVLayerView cache, cudaStream_t stream);

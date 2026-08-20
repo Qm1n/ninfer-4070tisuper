@@ -51,8 +51,10 @@ struct PrefillContext {
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
-    std::int32_t current_state_slot                         = 0;
-    std::int32_t rewrite_checkpoint_state_slot              = 0;
+    std::int32_t current_state_slot = 0;
+    // Fork: checkpoint capture targets the lane's pinned-host GDN image.
+    void* rewrite_checkpoint_linear_state                   = nullptr;
+    std::size_t rewrite_checkpoint_linear_state_bytes       = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
@@ -128,7 +130,8 @@ struct TargetVerifyFrameView {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t rewrite_checkpoint_state_slot,
+                         void* rewrite_checkpoint_linear_state,
+                         std::size_t rewrite_checkpoint_linear_state_bytes,
                          std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,

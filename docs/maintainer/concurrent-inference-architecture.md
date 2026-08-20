@@ -276,9 +276,12 @@ workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained 
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
 state 始终重新创建。
 
+<!-- // Fork: rewrite checkpoint state is cold pinned-host storage. -->
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
-`[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 rewrite-checkpoint
-state；一份 slot 同时选择全部 GDN layers 的 convolution history 和 recurrent state。Decode round
+`[0,C)` 作为各 lane 的 device-resident current committed state；每条 lane 的 rewrite-checkpoint
+state 位于独立 pinned-host image。Capture 在 prompt checkpoint boundary 将全部 GDN layers 的
+convolution history 和 recurrent state D2H 写入该 image，restore 在 prefix reuse admission 时 H2D
+覆盖对应 current slot。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
 
 ### 4.4 Batch row
@@ -1170,8 +1173,13 @@ graph key。Graph-off mode 按相同顺序 eager 提交这些动作。
 不得为每个 `B`、profile 或 captured definition 复制 logits、hidden、workspace 或 per-sequence state。
 Model/control ingress、forward 和 result egress 不存在 per-row CUDA submission；跨 page 时的 table
 publication 属于 state substrate materialization。Serving 期间不 capture、instantiate 或扩展 graph family。
+<!-- // Fork: startup graph memory is empirically calibrated before final capacity resolution. -->
 Startup graph allowance 必须计入全部 reachable exact-`B` definitions，以及每个 exact `B`、每个实际
 topology class 的一份 executable，不能沿用只覆盖 `B=1` definitions 的 reservation。
+启动时先使用每 lane 一个 physical KV page 的 calibration Program 捕获全部 reachable definitions，
+allowance 随后重建为 `max(16 MiB, observed + 24 MiB)`。Calibration 同时触发 MTP 路径的 lazy CUDA
+module allocations，使最终 capacity resolution 使用其后的真实 free VRAM。若最终 capture 仍发生 OOM
+或 observed 超过 allowance，Engine 只允许一次以 `observed + 48 MiB` 重建 capacity curve 并重试。
 
 Capture/smoke 使用的 temporary Paged-KV allocation 每个有效 row 只 materialize 一个 private physical
 page，并把该 page 重复发布到 temporary block-table row。准备一次 eager/smoke 时只清零 `[0,B)` 对应的

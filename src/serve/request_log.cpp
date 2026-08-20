@@ -100,6 +100,9 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "int8-group64";
     case ninfer::KvCacheStorage::Int4Group64:
         return "int4-group64";
+    case ninfer::KvCacheStorage::Int4Group128:
+        // Fork: distinguish the compact scale-plane encoding in server telemetry.
+        return "int4-group128";
     }
     return "unknown";
 }
@@ -514,7 +517,10 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
-             {"kv_payload_bytes", memory.kv_payload_bytes}};
+             {"kv_payload_bytes", memory.kv_payload_bytes},
+             // Fork: startup JSON exposes hot-device versus pinned-host GDN state ownership.
+             {"gdn_state_device_hot_bytes", memory.gdn_state_device_hot_bytes},
+             {"gdn_state_host_checkpoint_bytes", memory.gdn_state_host_checkpoint_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},

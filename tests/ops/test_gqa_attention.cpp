@@ -23,12 +23,15 @@ namespace {
 constexpr std::int32_t kHeadDim       = 256;
 constexpr std::int32_t kQuantGroup    = 64;
 constexpr std::int32_t kQuantGroups   = kHeadDim / kQuantGroup;
+// Fork: compact I4 oracle geometry uses two independently stored FP16 scales.
+constexpr std::int32_t kI4G128QuantGroup  = 128;
+constexpr std::int32_t kI4G128QuantGroups = kHeadDim / kI4G128QuantGroup;
 // Fork: I4 code planes store two signed nibbles per byte.
 constexpr std::int32_t kI4CodeRows    = kHeadDim / 2;
 constexpr float kAttentionScale       = 0.0625f;
 constexpr std::uint16_t kOutputCanary = 0x7fc1u;
 
-// Fork: the Op has three registered cache profiles. A1 and A3 share one criterion per profile;
+// Fork: the Op has four registered cache profiles. A1 and A3 share one criterion per profile;
 // token count, geometry, execution envelope, and private launch route do not select it.
 constexpr ReductionCriterion kAttentionBf16Criterion{
     /*relative_l2*/ 2.8e-3,
@@ -51,6 +54,14 @@ constexpr ReductionCriterion kAttentionInt4Criterion{
     /*relative_l2*/ 2.5e-2,
     /*gross_absolute*/ 1.2e-2,
     /*gross_relative_to_max_reference*/ 2.5e-2,
+};
+
+// Fork: I4-G128 is checked directly against the same FP64 attention oracle; its larger
+// absmax domain admits a modestly wider quantization envelope than I4-G64.
+constexpr ReductionCriterion kAttentionInt4G128Criterion{
+    /*relative_l2*/ 3.5e-2,
+    /*gross_absolute*/ 1.7e-2,
+    /*gross_relative_to_max_reference*/ 3.5e-2,
 };
 
 struct Geometry {
@@ -145,10 +156,11 @@ std::size_t cache_index(const Geometry& geometry, std::int32_t padded_context, s
 }
 
 std::size_t scale_index(const Geometry& geometry, std::int32_t padded_context, std::int32_t head,
-                        std::int32_t position, std::int32_t group) {
+                        std::int32_t position, std::int32_t group,
+                        std::int32_t quant_groups) {
     (void)geometry;
     return static_cast<std::size_t>(group) +
-           static_cast<std::size_t>(kQuantGroups) *
+           static_cast<std::size_t>(quant_groups) *
                (static_cast<std::size_t>(position) +
                 static_cast<std::size_t>(padded_context) * static_cast<std::size_t>(head));
 }
@@ -158,8 +170,9 @@ std::size_t cache_elements(const Geometry& geometry, std::int32_t padded_context
            static_cast<std::size_t>(geometry.kv_heads);
 }
 
-std::size_t scale_elements(const Geometry& geometry, std::int32_t padded_context) {
-    return static_cast<std::size_t>(kQuantGroups) * static_cast<std::size_t>(padded_context) *
+std::size_t scale_elements(const Geometry& geometry, std::int32_t padded_context,
+                           std::int32_t quant_groups) {
+    return static_cast<std::size_t>(quant_groups) * static_cast<std::size_t>(padded_context) *
            static_cast<std::size_t>(geometry.kv_heads);
 }
 
@@ -353,6 +366,17 @@ std::uint8_t pack_i4(std::int32_t even, std::int32_t odd) {
                                      ((static_cast<std::uint32_t>(odd) & 0x0fu) << 4));
 }
 
+// Fork: one closed helper keeps oracle and physical-plane geometry aligned.
+std::int32_t quant_group_for(PagedKVEncoding encoding) {
+    return encoding == PagedKVEncoding::I4G128 ? kI4G128QuantGroup : kQuantGroup;
+}
+
+std::int32_t quant_groups_for(PagedKVEncoding encoding) {
+    // Fork: retain the established G64 fixture geometry verbatim.
+    if (encoding == PagedKVEncoding::Bf16) { return 0; }
+    return encoding == PagedKVEncoding::I4G128 ? kI4G128QuantGroups : kQuantGroups;
+}
+
 void encode_group(const std::vector<float>& source, std::size_t source_base,
                   std::vector<std::int8_t>& codes, std::size_t code_base,
                   std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
@@ -376,19 +400,20 @@ void encode_group(const std::vector<float>& source, std::size_t source_base,
     }
 }
 
-// Fork: independent exact I4-G64 oracle with FP16_RNE(amax/7) scale storage.
+// Fork: independent exact I4-G64/G128 oracle with FP16_RNE(amax/7) scale storage.
 void encode_group_i4(const std::vector<float>& source, std::size_t source_base,
                      std::vector<std::uint8_t>& codes, std::size_t code_base,
-                     std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
+                     std::vector<std::uint16_t>& scales, std::size_t scale_offset,
+                     std::int32_t quant_group) {
     float absmax = 0.0f;
-    for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+    for (std::int32_t i = 0; i < quant_group; ++i) {
         absmax = std::max(absmax, std::abs(source[source_base + static_cast<std::size_t>(i)]));
     }
     const std::uint16_t scale_bits = f32_to_f16_bits(absmax / 7.0f);
     const float stored_scale       = f16_bits_to_f32(scale_bits);
     const float inverse_scale      = stored_scale == 0.0f ? 0.0f : 1.0f / stored_scale;
     scales[scale_offset]           = scale_bits;
-    for (std::int32_t byte = 0; byte < kQuantGroup / 2; ++byte) {
+    for (std::int32_t byte = 0; byte < quant_group / 2; ++byte) {
         std::int32_t q0 = 0;
         std::int32_t q1 = 0;
         if (stored_scale != 0.0f) {
@@ -423,23 +448,27 @@ HostCache make_cache(const Geometry& geometry, PagedKVEncoding encoding,
         cache.k_i4.assign(elements / 2, 0);
         cache.v_i4.assign(elements / 2, 0);
     }
-    const std::size_t scales = scale_elements(geometry, logical_capacity);
+    const std::int32_t quant_group  = quant_group_for(encoding);
+    const std::int32_t quant_groups = quant_groups_for(encoding);
+    const std::size_t scales = scale_elements(geometry, logical_capacity, quant_groups);
     cache.k_scale.assign(scales, 0);
     cache.v_scale.assign(scales, 0);
     for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
-            for (std::int32_t group = 0; group < kQuantGroups; ++group) {
-                const std::int32_t d   = group * kQuantGroup;
+            for (std::int32_t group = 0; group < quant_groups; ++group) {
+                const std::int32_t d   = group * quant_group;
                 const std::size_t code = cache_index(geometry, logical_capacity, head, position, d);
                 const std::size_t scale =
-                    scale_index(geometry, logical_capacity, head, position, group);
+                    scale_index(geometry, logical_capacity, head, position, group, quant_groups);
                 if (encoding == PagedKVEncoding::I8G64) {
                     encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
                     encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
                 } else {
                     const std::size_t packed = code / 2;
-                    encode_group_i4(logical_k, code, cache.k_i4, packed, cache.k_scale, scale);
-                    encode_group_i4(logical_v, code, cache.v_i4, packed, cache.v_scale, scale);
+                    encode_group_i4(logical_k, code, cache.k_i4, packed, cache.k_scale, scale,
+                                    quant_group);
+                    encode_group_i4(logical_v, code, cache.v_i4, packed, cache.v_scale, scale,
+                                    quant_group);
                 }
             }
         }
@@ -464,19 +493,24 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                 continue;
             }
 
-            for (std::int32_t group = 0; group < kQuantGroups; ++group) {
-                const std::int32_t d     = group * kQuantGroup;
+            const std::int32_t quant_group  = quant_group_for(cache.encoding);
+            const std::int32_t quant_groups = quant_groups_for(cache.encoding);
+            for (std::int32_t group = 0; group < quant_groups; ++group) {
+                const std::int32_t d     = group * quant_group;
                 const std::size_t source = kv_input_index(geometry, head, d, token);
                 const std::size_t target =
                     cache_index(geometry, cache.logical_capacity, head, position, d);
                 const std::size_t scale =
-                    scale_index(geometry, cache.logical_capacity, head, position, group);
+                    scale_index(geometry, cache.logical_capacity, head, position, group,
+                                quant_groups);
                 if (cache.encoding == PagedKVEncoding::I8G64) {
                     encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
                     encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
                 } else {
-                    encode_group_i4(k, source, cache.k_i4, target / 2, cache.k_scale, scale);
-                    encode_group_i4(v, source, cache.v_i4, target / 2, cache.v_scale, scale);
+                    encode_group_i4(k, source, cache.k_i4, target / 2, cache.k_scale, scale,
+                                    quant_group);
+                    encode_group_i4(v, source, cache.v_i4, target / 2, cache.v_scale, scale,
+                                    quant_group);
                 }
             }
         }
@@ -490,8 +524,10 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
         return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
     }
 
-    const std::size_t scale =
-        scale_index(cache.geometry, cache.logical_capacity, head, position, d / kQuantGroup);
+    const std::int32_t quant_group  = quant_group_for(cache.encoding);
+    const std::int32_t quant_groups = quant_groups_for(cache.encoding);
+    const std::size_t scale = scale_index(cache.geometry, cache.logical_capacity, head, position,
+                                          d / quant_group, quant_groups);
     const auto& scales  = key ? cache.k_scale : cache.v_scale;
     float decoded       = 0.0f;
     if (cache.encoding == PagedKVEncoding::I8G64) {
@@ -573,7 +609,9 @@ DType physical_code_dtype(PagedKVEncoding encoding) {
 }
 
 std::int32_t physical_code_rows(PagedKVEncoding encoding) {
-    return encoding == PagedKVEncoding::I4G64 ? kI4CodeRows : kHeadDim;
+    return (encoding == PagedKVEncoding::I4G64 || encoding == PagedKVEncoding::I4G128)
+               ? kI4CodeRows
+               : kHeadDim;
 }
 
 class DeviceCache {
@@ -583,11 +621,13 @@ public:
           logical_capacity_(cache.logical_capacity),
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
           physical_pages_(physical_page_count(logical_pages_, mapping)),
+          // Fork: allocate the exact two- or four-scale physical plane.
+          scale_groups_(quant_groups_for(encoding_)),
           block_table_host_(make_block_table(logical_pages_, mapping)),
           code_elements_(static_cast<std::size_t>(physical_code_rows(encoding_)) *
                          kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
-          scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
+          scale_elements_(static_cast<std::size_t>(scale_groups_) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
           k_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
           v_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
@@ -613,10 +653,10 @@ public:
                 scatter_paged(cache.v_i8, kHeadDim, geometry_, logical_capacity_, block_table_host_,
                               physical_pages_);
             const auto ks_physical =
-                scatter_paged(cache.k_scale, kQuantGroups, geometry_, logical_capacity_,
+                scatter_paged(cache.k_scale, scale_groups_, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             const auto vs_physical =
-                scatter_paged(cache.v_scale, kQuantGroups, geometry_, logical_capacity_,
+                scatter_paged(cache.v_scale, scale_groups_, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::int8_t));
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::int8_t));
@@ -631,10 +671,10 @@ public:
                 scatter_paged(cache.v_i4, kI4CodeRows, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             const auto ks_physical =
-                scatter_paged(cache.k_scale, kQuantGroups, geometry_, logical_capacity_,
+                scatter_paged(cache.k_scale, scale_groups_, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             const auto vs_physical =
-                scatter_paged(cache.v_scale, kQuantGroups, geometry_, logical_capacity_,
+                scatter_paged(cache.v_scale, scale_groups_, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size());
             v_.copy_from_host(v_physical.data(), v_physical.size());
@@ -659,11 +699,11 @@ public:
         if (is_quantized(encoding_)) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
-                       {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+                       {scale_groups_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
             result.v_scale_pages =
                 Tensor(v_scale_.data(), DType::FP16,
-                       {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-            result.quant_group = kQuantGroup;
+                       {scale_groups_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+            result.quant_group = quant_group_for(encoding_);
         }
         return result;
     }
@@ -702,9 +742,9 @@ public:
                                                                logical_capacity_, block_table_host_);
             cache.v_i8             = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
                                                                logical_capacity_, block_table_host_);
-            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
+            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, scale_groups_, geometry_,
                                                         logical_capacity_, block_table_host_);
-            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
+            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, scale_groups_, geometry_,
                                                         logical_capacity_, block_table_host_);
         } else {
             const auto k_physical  = copy_from_guarded<std::uint8_t>(k_, code_elements_);
@@ -715,9 +755,9 @@ public:
                                                     logical_capacity_, block_table_host_);
             cache.v_i4 = gather_paged<std::uint8_t>(v_physical, kI4CodeRows, geometry_,
                                                     logical_capacity_, block_table_host_);
-            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
+            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, scale_groups_, geometry_,
                                                         logical_capacity_, block_table_host_);
-            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
+            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, scale_groups_, geometry_,
                                                         logical_capacity_, block_table_host_);
         }
         return cache;
@@ -747,6 +787,8 @@ private:
     std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
+    // Fork: physical scale leading extent follows the semantic encoding.
+    std::int32_t scale_groups_;
     std::vector<std::int32_t> block_table_host_;
     std::size_t code_elements_;
     std::size_t scale_elements_;
@@ -766,11 +808,13 @@ public:
           physical_pages_(mapping == MappingPattern::Fragmented
                               ? 2 * static_cast<std::int32_t>(rows_) * logical_pages_ + 1
                               : static_cast<std::int32_t>(rows_) * logical_pages_),
+          // Fork: batch storage retains the exact compact scale leading extent.
+          scale_groups_(quant_groups_for(encoding_)),
           block_tables_host_(rows_ * static_cast<std::size_t>(logical_pages_)),
           code_elements_(static_cast<std::size_t>(physical_code_rows(encoding_)) *
                          kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
-          scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
+          scale_elements_(static_cast<std::size_t>(scale_groups_) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
           k_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
           v_(code_elements_ * (encoding_ == PagedKVEncoding::Bf16 ? sizeof(std::uint16_t) : 1)),
@@ -813,11 +857,11 @@ public:
         if (is_quantized(encoding_)) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
-                       {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+                       {scale_groups_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
             result.v_scale_pages =
                 Tensor(v_scale_.data(), DType::FP16,
-                       {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-            result.quant_group = kQuantGroup;
+                       {scale_groups_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+            result.quant_group = quant_group_for(encoding_);
         }
         return result;
     }
@@ -849,9 +893,9 @@ public:
                                    table, expected_k);
                 scatter_paged_into(expected[row].v_i8, kHeadDim, geometry_, logical_capacity_,
                                    table, expected_v);
-                scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_,
+                scatter_paged_into(expected[row].k_scale, scale_groups_, geometry_,
                                    logical_capacity_, table, expected_ks);
-                scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
+                scatter_paged_into(expected[row].v_scale, scale_groups_, geometry_,
                                    logical_capacity_, table, expected_vs);
             }
             failures +=
@@ -877,9 +921,9 @@ public:
                                    table, expected_k);
                 scatter_paged_into(expected[row].v_i4, kI4CodeRows, geometry_, logical_capacity_,
                                    table, expected_v);
-                scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_,
+                scatter_paged_into(expected[row].k_scale, scale_groups_, geometry_,
                                    logical_capacity_, table, expected_ks);
-                scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
+                scatter_paged_into(expected[row].v_scale, scale_groups_, geometry_,
                                    logical_capacity_, table, expected_vs);
             }
             failures += verify_exact((label + " cache-k-code").c_str(),
@@ -945,9 +989,9 @@ private:
                                    physical_k);
                 scatter_paged_into(rows[row].v_i8, kHeadDim, geometry_, logical_capacity_, table,
                                    physical_v);
-                scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_, logical_capacity_,
+                scatter_paged_into(rows[row].k_scale, scale_groups_, geometry_, logical_capacity_,
                                    table, physical_ks);
-                scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_, logical_capacity_,
+                scatter_paged_into(rows[row].v_scale, scale_groups_, geometry_, logical_capacity_,
                                    table, physical_vs);
             }
             k_.copy_from_host(physical_k.data(), physical_k.size() * sizeof(std::int8_t));
@@ -969,9 +1013,9 @@ private:
                                physical_k);
             scatter_paged_into(rows[row].v_i4, kI4CodeRows, geometry_, logical_capacity_, table,
                                physical_v);
-            scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_, logical_capacity_, table,
+            scatter_paged_into(rows[row].k_scale, scale_groups_, geometry_, logical_capacity_, table,
                                physical_ks);
-            scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_, logical_capacity_, table,
+            scatter_paged_into(rows[row].v_scale, scale_groups_, geometry_, logical_capacity_, table,
                                physical_vs);
         }
         k_.copy_from_host(physical_k.data(), physical_k.size());
@@ -987,6 +1031,8 @@ private:
     std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
+    // Fork: physical scale leading extent follows the semantic encoding.
+    std::int32_t scale_groups_;
     std::vector<std::int32_t> block_tables_host_;
     std::size_t code_elements_;
     std::size_t scale_elements_;
@@ -1036,14 +1082,16 @@ int verify_positions(const std::string& label, const GuardedDeviceBuffer& device
 // Fork: name all semantic encodings in conformance failures.
 const char* cache_name(PagedKVEncoding encoding) {
     if (encoding == PagedKVEncoding::Bf16) { return "bf16"; }
-    return encoding == PagedKVEncoding::I8G64 ? "int8-g64" : "int4-g64";
+    if (encoding == PagedKVEncoding::I8G64) { return "int8-g64"; }
+    return encoding == PagedKVEncoding::I4G64 ? "int4-g64" : "int4-g128";
 }
 
 ReductionCriterion attention_criterion(PagedKVEncoding encoding) {
     // Fork: every native encoding owns an explicit direct-to-oracle criterion.
     if (encoding == PagedKVEncoding::Bf16) { return kAttentionBf16Criterion; }
-    return encoding == PagedKVEncoding::I8G64 ? kAttentionInt8Criterion
-                                              : kAttentionInt4Criterion;
+    if (encoding == PagedKVEncoding::I8G64) { return kAttentionInt8Criterion; }
+    return encoding == PagedKVEncoding::I4G64 ? kAttentionInt4Criterion
+                                              : kAttentionInt4G128Criterion;
 }
 
 int verify_attention(const std::string& label, const std::vector<double>& actual,
@@ -1453,6 +1501,9 @@ int run_batch_cases() {
     // Fork: batch A1 covers packed I4 append plus decode with a partial row.
     failures += run_batch_case(kGeometries[0], PagedKVEncoding::I4G64,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 498u});
+    // Fork: exact batch append covers both packed output halves and the two-scale plane.
+    failures += run_batch_case(kGeometries[0], PagedKVEncoding::I4G128,
+                               {6, {127}, {3}, {0}, MappingPattern::Fragmented, 497u});
     failures += run_batch_case(kGeometries[0], PagedKVEncoding::Bf16,
                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
     failures += run_batch_case(kGeometries[0], PagedKVEncoding::Bf16,
@@ -1477,7 +1528,8 @@ int run_geometry(const Geometry& geometry) {
     // Fork: run A1/A2/A3 and mapping coverage for every semantic paged-KV encoding.
     for (const PagedKVEncoding encoding : {PagedKVEncoding::Bf16,
                                            PagedKVEncoding::I8G64,
-                                           PagedKVEncoding::I4G64}) {
+                                           PagedKVEncoding::I4G64,
+                                           PagedKVEncoding::I4G128}) {
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(geometry, encoding, mapping, 100u + geometry.q_heads);
@@ -1526,11 +1578,12 @@ int verify_workspace_capacity_contract() {
     int failures = 0;
     // Fork: every native paged-KV encoding must be accepted by workspace planning.
     (void)ops::gqa_attention_workspace_capacity_bytes(
-        16, PagedKVEncoding::I4G64, {1, 1025}, 1, 1, 1);
+        16, PagedKVEncoding::I4G128, {1, 1025}, 1, 1, 1);
     // Fork: interval capacity admits packed I4 as a first-class encoding.
     for (const PagedKVEncoding encoding : {PagedKVEncoding::Bf16,
                                            PagedKVEncoding::I8G64,
-                                           PagedKVEncoding::I4G64}) {
+                                           PagedKVEncoding::I4G64,
+                                           PagedKVEncoding::I4G128}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
             ops::gqa_attention_workspace_capacity_bytes(16, encoding, envelope, 1, 1, 17);

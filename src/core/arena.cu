@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -59,6 +60,10 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
+        // Fork: surface allocation exhaustion to startup graph retry without weakening other errors.
+        if (err == cudaErrorMemoryAllocation) {
+            throw CudaOutOfMemory(cuda_error_message("cudaMalloc failed", err));
+        }
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
     p = ptr;
@@ -139,6 +144,10 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
     if (err != cudaSuccess) {
+        // Fork: final Program construction may replan once with a larger graph allowance.
+        if (err == cudaErrorMemoryAllocation) {
+            throw CudaOutOfMemory(cuda_error_message("cudaMalloc failed", err));
+        }
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
 
@@ -238,9 +247,10 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    // Fork: use the explicit cudaHostAlloc contract shared with artifact pinned retention.
+    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocDefault);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
     }
 
     data_ = ptr;

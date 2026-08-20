@@ -186,7 +186,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       // Fork: Program retains the semantic paged-KV encoding selected at startup.
       kv_encoding(plan.kv_encoding), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      use_cuda_graph(plan.use_cuda_graph), graph_calibration(plan.graph_calibration),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
@@ -232,6 +233,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
+    // Fork: allocate cold rewrite checkpoints in pinned host memory after binding the hot pool.
+    gdn_state_slot_bytes = decoder->linear_attention.slot_image_bytes();
+    if (gdn_state_slot_bytes == 0 ||
+        gdn_state_slot_bytes > std::numeric_limits<std::size_t>::max() / max_concurrency) {
+        throw std::overflow_error("rewrite-checkpoint GDN host storage size is invalid");
+    }
+    rewrite_checkpoint_linear_states.emplace(gdn_state_slot_bytes * max_concurrency);
 
     io = qwen3_6::RoundState(backing, plan.persistent.round);
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
@@ -542,10 +550,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
-            decoder->linear_attention.copy_slot(
-                LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
-                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                device.stream);
+            // Fork: prefix restore is the only H2D GDN-checkpoint transfer.
+            decoder->linear_attention.copy_slot_from_host(
+                rewrite_checkpoint_linear_state(sequence.lane), gdn_state_slot_bytes,
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
         } else {
@@ -1386,10 +1394,9 @@ void ProgramImplCore::prepare_graphs() {
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
     const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
     graph_observed_bytes       = consumed;
-    if (consumed > graph_allowance_bytes) {
-        throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
-                                 " bytes, exceeding the planned allowance of " +
-                                 std::to_string(graph_allowance_bytes) + " bytes");
+    if (!graph_calibration && consumed > graph_allowance_bytes) {
+        // Fork: let the registry grow the calibrated allowance once and rebuild the final Program.
+        throw CudaGraphAllowanceExceeded(consumed);
     }
     for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }
     dflash_capture_allocations.clear();
@@ -1419,6 +1426,15 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void* ProgramImplCore::rewrite_checkpoint_linear_state(std::uint32_t lane) const {
+    // Fork: lane validation keeps host checkpoint address arithmetic explicit and bounded.
+    if (lane >= max_concurrency || !rewrite_checkpoint_linear_states) {
+        throw std::out_of_range("rewrite-checkpoint GDN host lane is unavailable");
+    }
+    return static_cast<unsigned char*>(rewrite_checkpoint_linear_states->data()) +
+           static_cast<std::size_t>(lane) * gdn_state_slot_bytes;
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -1540,7 +1556,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             &sequence.rewrite_checkpoint_hidden,
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+            // Fork: checkpoint capture receives the lane's pinned-host GDN image.
+            rewrite_checkpoint_linear_state(sequence.lane),
+            gdn_state_slot_bytes,
             staged.initial_mtp_extent,
             dflash_host_ingress};
 
@@ -2221,6 +2239,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     case PagedKVEncoding::I4G64:
         out.kv_cache = KvCacheStorage::Int4Group64;
         break;
+    case PagedKVEncoding::I4G128:
+        // Fork: retain the exact physical scale encoding in public memory telemetry.
+        out.kv_cache = KvCacheStorage::Int4Group128;
+        break;
     }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
@@ -2231,6 +2253,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    // Fork: report the exact per-Program GDN placement selected by the host-checkpoint design.
+    out.gdn_state_device_hot_bytes      = gdn_state_slot_bytes * max_concurrency;
+    out.gdn_state_host_checkpoint_bytes = rewrite_checkpoint_linear_states
+                                              ? rewrite_checkpoint_linear_states->size()
+                                              : 0;
     return out;
 }
 

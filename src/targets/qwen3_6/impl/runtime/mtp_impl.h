@@ -25,8 +25,10 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    // Fork: prompt rollback is a pinned-host image; steady-state MTP only carries its view.
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.rewrite_checkpoint_linear_state,
+                        state.rewrite_checkpoint_linear_state_bytes, state.mtp_proposal_extent);
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);

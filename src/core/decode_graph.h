@@ -2,9 +2,24 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <functional>
+#include <stdexcept>
 
 namespace ninfer {
+
+// Fork: a successful capture that exceeds calibration is replanned instead of retained silently.
+class CudaGraphAllowanceExceeded final : public std::runtime_error {
+public:
+    explicit CudaGraphAllowanceExceeded(std::size_t observed_bytes)
+        : std::runtime_error("CUDA Graph observed bytes exceed the calibrated allowance"),
+          observed_bytes_(observed_bytes) {}
+
+    [[nodiscard]] std::size_t observed_bytes() const noexcept { return observed_bytes_; }
+
+private:
+    std::size_t observed_bytes_ = 0;
+};
 
 class DecodeGraphDefinition {
 public:

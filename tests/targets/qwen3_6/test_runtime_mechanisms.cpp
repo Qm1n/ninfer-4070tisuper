@@ -48,7 +48,12 @@ q36::DecoderStateSpec decoder_spec(ninfer::PagedKVEncoding encoding, bool mtp) {
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
         .kv_encoding               = encoding,
-        .kv_quant_group = encoding == ninfer::PagedKVEncoding::Bf16 ? 0 : q36::kKvQuantGroup,
+        // Fork: compact I4 owns G128 while every established test route remains G64.
+        .kv_quant_group = encoding == ninfer::PagedKVEncoding::Bf16
+                              ? 0
+                              : (encoding == ninfer::PagedKVEncoding::I4G128
+                                     ? q36::kKvI4Group128
+                                     : q36::kKvQuantGroup),
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -142,6 +147,28 @@ void test_decoder_layout() {
     (void)i4_131k_builder.finish(256);
     expect(i4_131k.kv_payload_bytes() == 2281701376ULL,
            "131K INT4 Text KV payload is not exactly 2.125 GiB");
+
+    // Fork: pin the target MTP3 G128 payload: 16 Text layers at 2048 pages plus one MTP layer
+    // at 2049 pages (one speculative overflow page) totals exactly 2,353,072,128 bytes.
+    q36::DecoderStateSpec i4_g128_131k_spec =
+        decoder_spec(ninfer::PagedKVEncoding::I4G128, true);
+    i4_g128_131k_spec.full_attention_layers     = 16;
+    i4_g128_131k_spec.mtp_layers                = 1;
+    i4_g128_131k_spec.capacity                  = 131072;
+    i4_g128_131k_spec.kv_heads                  = 4;
+    i4_g128_131k_spec.attention_head_dim        = 256;
+    i4_g128_131k_spec.text_physical_page_groups = 2048;
+    i4_g128_131k_spec.mtp_physical_page_groups  = 2049;
+    ninfer::LayoutBuilder i4_g128_131k_builder;
+    const q36::DecoderStateLayout i4_g128_131k =
+        q36::plan_decoder_state(i4_g128_131k_builder, i4_g128_131k_spec);
+    (void)i4_g128_131k_builder.finish(256);
+    expect(i4_g128_131k.text_kv.pool.planes[2].spec.leading_extent == 2 &&
+               i4_g128_131k.mtp_kv &&
+               i4_g128_131k.mtp_kv->pool.planes[2].spec.leading_extent == 2,
+           "INT4-G128 scale planes do not have two rows per head");
+    expect(i4_g128_131k.kv_payload_bytes() == 2353072128ULL,
+           "131K MTP INT4-G128 KV payload does not match the capacity curve");
 }
 
 void test_round_layout() {

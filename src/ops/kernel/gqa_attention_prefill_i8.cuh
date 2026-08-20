@@ -146,7 +146,7 @@ __launch_bounds__(256) __global__
 }
 
 // Fork: exact signed-nibble append codec; one lane emits one adjacent-value code byte.
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, int CacheQuantGroup>
 __launch_bounds__(256) __global__
     void gqa_attention_prefill_fill_i4_kernel(const __nv_bfloat16* __restrict__ k,
                                               const __nv_bfloat16* __restrict__ v,
@@ -162,19 +162,25 @@ __launch_bounds__(256) __global__
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
     const int lane              = static_cast<int>(threadIdx.x) & 31;
     const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
-    const int units             = tokens * Geometry::KVHeads * kGqaPrefillI8Groups;
+    // Fork: one warp covers either one 64-value group or both 64-value halves of G128.
+    constexpr int CacheGroups = kGqaKvQuantHeadDim / CacheQuantGroup;
+    static_assert(CacheQuantGroup == kGqaKvQuantGroup ||
+                  CacheQuantGroup == kGqaKvI4G128Group);
+    const int units = tokens * Geometry::KVHeads * CacheGroups;
     if (unit >= units) { return; }
 
-    const int group                 = unit % kGqaPrefillI8Groups;
-    const int tmp                   = unit / kGqaPrefillI8Groups;
+    const int group                 = unit % CacheGroups;
+    const int tmp                   = unit / CacheGroups;
     const int kv_head               = tmp % Geometry::KVHeads;
     const int token                 = tmp / Geometry::KVHeads;
     const int position              = positions[0] + token;
     const std::int32_t* block_table = metadata.block_table();
     int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     const int page_off              = position & kPagedKVPageMask;
-    const int d0                    = group * kGqaKvQuantGroup + 2 * lane;
+    const int d0                    = group * CacheQuantGroup + 2 * lane;
     const int d1                    = d0 + 1;
+    const int d2                    = d0 + 64;
+    const int d3                    = d1 + 64;
 
     const std::int64_t src0 = gqa_kv_quant_src_index<Geometry>(kv_head, d0, token);
     const std::int64_t src1 = gqa_kv_quant_src_index<Geometry>(kv_head, d1, token);
@@ -182,9 +188,20 @@ __launch_bounds__(256) __global__
     const float k1          = __bfloat162float(k[src1]);
     const float v0          = __bfloat162float(v[src0]);
     const float v1          = __bfloat162float(v[src1]);
+    float k2 = 0.0f, k3 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+    if constexpr (CacheQuantGroup == kGqaKvI4G128Group) {
+        const std::int64_t src2 = gqa_kv_quant_src_index<Geometry>(kv_head, d2, token);
+        const std::int64_t src3 = gqa_kv_quant_src_index<Geometry>(kv_head, d3, token);
+        k2                      = __bfloat162float(k[src2]);
+        k3                      = __bfloat162float(k[src3]);
+        v2                      = __bfloat162float(v[src2]);
+        v3                      = __bfloat162float(v[src3]);
+    }
 
-    const float k_abs = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
-    const float v_abs = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
+    const float k_abs = warp_max(
+        fmaxf(fmaxf(fabsf(k0), fabsf(k1)), fmaxf(fabsf(k2), fabsf(k3))), FullMask);
+    const float v_abs = warp_max(
+        fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3))), FullMask);
     const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / 7.0f : 0.0f);
     const __half vsh  = __float2half_rn(v_abs > 0.0f ? v_abs / 7.0f : 0.0f);
     const float ks    = __half2float(ksh);
@@ -194,14 +211,25 @@ __launch_bounds__(256) __global__
     page              = __shfl_sync(FullMask, page, 0);
 
     const std::int64_t code_base =
-        gqa_kv_quant_i4_code_index<Geometry>(page, kv_head, group * 32, page_off);
+        gqa_kv_quant_i4_code_index<Geometry>(page, kv_head, group * (CacheQuantGroup / 2),
+                                             page_off);
     cache_k[code_base + lane] =
         gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(k0, kinv), gqa_kv_quant_i4_code(k1, kinv));
     cache_v[code_base + lane] =
         gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(v0, vinv), gqa_kv_quant_i4_code(v1, vinv));
+    if constexpr (CacheQuantGroup == kGqaKvI4G128Group) {
+        cache_k[code_base + lane + 32] =
+            gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(k2, kinv), gqa_kv_quant_i4_code(k3, kinv));
+        cache_v[code_base + lane + 32] =
+            gqa_kv_pack_i4_pair(gqa_kv_quant_i4_code(v2, vinv), gqa_kv_quant_i4_code(v3, vinv));
+    }
     if (lane == 0) {
-        const std::int64_t scale_off =
-            gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
+        const std::int64_t scale_off = [&]() {
+            if constexpr (CacheQuantGroup == kGqaKvI4G128Group) {
+                return gqa_kv_i4_g128_scale_index<Geometry>(page, kv_head, group, page_off);
+            }
+            return gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
+        }();
         scale_k[scale_off] = ksh;
         scale_v[scale_off] = vsh;
     }
@@ -276,7 +304,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     }
 }
 
-template <typename Geometry, typename Metadata, typename CacheCode>
+template <typename Geometry, typename Metadata, typename CacheCode, int CacheQuantGroup>
 __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const CacheCode* __restrict__ cache_k,
     const CacheCode* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -299,6 +327,10 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     constexpr unsigned FullMask = 0xffffffffu;
     // Fork: unsigned code elements select native packed signed-nibble storage.
     constexpr bool I4 = std::is_same_v<CacheCode, std::uint8_t>;
+    // Fork: physical G128 scales are duplicated into the four QK/PV G64 scale lanes.
+    static_assert(CacheQuantGroup == kGqaKvQuantGroup ||
+                  CacheQuantGroup == kGqaKvI4G128Group);
+    static_assert(I4 || CacheQuantGroup == kGqaKvQuantGroup);
     using PvType      = std::conditional_t<I4, __nv_bfloat16, __half>;
 
     static_assert(GroupKc == 2);
@@ -379,10 +411,27 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * Groups];
             if (key <= max_query_abs) {
-                const std::int64_t off =
-                    gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
-                ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
+                if constexpr (CacheQuantGroup == kGqaKvI4G128Group) {
+                    const std::int64_t off =
+                        gqa_kv_i4_g128_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
+                    const __half ks0 = cache_k_scale[off];
+                    const __half ks1 = cache_k_scale[off + 1];
+                    const __half vs0 = cache_v_scale[off];
+                    const __half vs1 = cache_v_scale[off + 1];
+                    kd[0] = ks0;
+                    kd[1] = ks0;
+                    kd[2] = ks1;
+                    kd[3] = ks1;
+                    vd[0] = vs0;
+                    vd[1] = vs0;
+                    vd[2] = vs1;
+                    vd[3] = vs1;
+                } else {
+                    const std::int64_t off =
+                        gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
+                    ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
+                    ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
+                }
             } else {
                 store_vec(kd, make_int2(0, 0));
                 store_vec(vd, make_int2(0, 0));

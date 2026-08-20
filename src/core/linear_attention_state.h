@@ -61,6 +61,13 @@ struct LinearAttentionStatePool {
     [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
 
+    // Fork: rewrite checkpoints use one packed, pinned-host image instead of a second device slot.
+    [[nodiscard]] std::size_t slot_image_bytes() const noexcept;
+    void copy_slot_to_host(std::int32_t src, void* host, std::size_t host_bytes,
+                           cudaStream_t stream = nullptr) const;
+    void copy_slot_from_host(const void* host, std::size_t host_bytes, std::int32_t dst,
+                             cudaStream_t stream = nullptr);
+
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
 };

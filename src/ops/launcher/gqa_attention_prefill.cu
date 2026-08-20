@@ -26,14 +26,21 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     CUDA_CHECK(attr_bf16);
     static const cudaError_t attr_i8 =
         cudaFuncSetAttribute(
-            gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::int8_t>,
+            gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::int8_t,
+                                            kGqaKvQuantGroup>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
     CUDA_CHECK(attr_i8);
     // Fork: I4 uses the same bounded shared arena with packed K4/V4 staging.
     static const cudaError_t attr_i4 = cudaFuncSetAttribute(
-        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::uint8_t>,
+        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::uint8_t, kGqaKvQuantGroup>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI4SmemBytes);
     CUDA_CHECK(attr_i4);
+    // Fork: G128 changes only scale-plane fetch and shares the bounded I4 arena.
+    static const cudaError_t attr_i4_g128 = cudaFuncSetAttribute(
+        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::uint8_t,
+                                        kGqaKvI4G128Group>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI4SmemBytes);
+    CUDA_CHECK(attr_i4_g128);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.encoding == PagedKVEncoding::I8G64) {
@@ -41,7 +48,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::int8_t>
+        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::int8_t, kGqaKvQuantGroup>
             <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::int8_t*>(cache_k.data),
@@ -56,7 +63,22 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::uint8_t>
+        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::uint8_t, kGqaKvQuantGroup>
+            <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI4SmemBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::uint8_t*>(cache_k.data),
+                static_cast<const std::uint8_t*>(cache_v.data),
+                static_cast<const __half*>(cache_k_scale.data),
+                static_cast<const __half*>(cache_v_scale.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens);
+    } else if (cache.encoding == PagedKVEncoding::I4G128) {
+        // Fork: packed codes are unchanged; the attention specialization expands two scales.
+        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
+                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+        const Tensor& cache_k_scale = cache.k_scale_pages;
+        const Tensor& cache_v_scale = cache.v_scale_pages;
+        gqa_attention_prefill_i8_kernel<Geometry, Metadata, std::uint8_t, kGqaKvI4G128Group>
             <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI4SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::uint8_t*>(cache_k.data),
@@ -132,7 +154,27 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
             static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
         const int fill_grid =
             static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
-        gqa_attention_prefill_fill_i4_kernel<Geometry, Metadata>
+        gqa_attention_prefill_fill_i4_kernel<Geometry, Metadata, kGqaKvQuantGroup>
+            <<<fill_grid, kFillBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data), metadata,
+                static_cast<std::uint8_t*>(cache_k.data),
+                static_cast<std::uint8_t*>(cache_v.data),
+                static_cast<__half*>(cache_k_scale.data),
+                static_cast<__half*>(cache_v_scale.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (cache.encoding == PagedKVEncoding::I4G128) {
+        // Fork: one warp encodes a token/head/G128 unit and emits two packed half-groups.
+        Tensor& cache_k_scale    = cache.k_scale_pages;
+        Tensor& cache_v_scale    = cache.v_scale_pages;
+        constexpr int kFillBlock = 256;
+        constexpr int kFillWarps = kFillBlock / 32;
+        const std::int64_t fill_units =
+            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvI4G128Groups;
+        const int fill_grid =
+            static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
+        gqa_attention_prefill_fill_i4_kernel<Geometry, Metadata, kGqaKvI4G128Group>
             <<<fill_grid, kFillBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(k.data),
                 static_cast<const __nv_bfloat16*>(v.data),

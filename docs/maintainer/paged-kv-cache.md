@@ -261,17 +261,18 @@ KV Store 只使用这些 storage facts。Head count、head dimension、GQA/MHA/M
 MTP/DFlash 身份以及 Attention 语义全部由 target layout 和 consuming Op 解释。Allocator 不包含
 attention-type variant。
 
+<!-- // Fork: causal scale planes admit the registered G64 and G128 leading extents. -->
 Consumer 对 K/V plane 使用统一的逻辑坐标 `K/V[d,h,p]`。Physical axis order 由 homogeneous pool
 固定，不由 allocator 或单次 request 选择：
 
 ```text
-Pool            K/V or code plane       INT8-G64 scale plane
-Main Text/MTP   [D, P, Hkv, Nphysical]  [D/64, P, Hkv, Nphysical]
+Pool            K/V or code plane       Quantized scale plane
+Main Text/MTP   [D, P, Hkv, Nphysical]  [D/G, P, Hkv, Nphysical], G=64 or 128
 DFlash Full     [D, P, Nphysical, Hkv]  not used
 ```
 
 Main Text/MTP 使用 contiguous page-major order。对 element bytes `E` 和第一维 extent `X`（K/V/code
-为 `D`，scale 为 `D/64`）：
+为 `D`（packed I4 code 为 `D/2`），scale 为 `D/G`）：
 
 ```text
 nb[0] = E
@@ -304,7 +305,8 @@ DFlash Full: K[d,h,p] = k_pages[d,o,g,h]
              V[d,h,p] = v_pages[d,o,g,h]
 ```
 
-INT8 code 使用同一公式；scale 把 `d` 换成 quant group `d/64`。K、V、code 和 scale 不保存各自的
+INT8 和 packed I4 code 使用同一 page translation；scale 把 `d` 换成 quant group `d/G`，其中
+INT8-G64/I4-G64 的 `G=64`，I4-G128 的 `G=128`。K、V、code 和 scale 不保存各自的
 page pointer table，而是使用同一个 pool-local page-group ID `g`。
 
 Common allocator 接收已经确定的 closed plane order、bytes、strides 和 alignment，不从中推导 head、codec
@@ -356,6 +358,7 @@ Attention input metadata。
 
 对一个 cache family 的 `layers=L`、KV heads `H`、head dimension `D`：
 
+<!-- // Fork: packed I4 code bytes are invariant while scale bytes follow G. -->
 ```text
 BF16 bytes/token
     = 2(K,V) * L * H * D * 2
@@ -363,6 +366,10 @@ BF16 bytes/token
 INT8-G64 bytes/token
     = 2(K,V) * L * H * D
     + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
+
+I4-G{64,128} bytes/token
+    = 2(K,V) * L * H * (D/2)
+    + 2(K,V) * L * H * (D/G) * sizeof(FP16 scale)
 ```
 
 一个 homogeneous pool 的 logical page-group payload 是其全部 grouped planes 的 bytes/token 之和乘以
@@ -949,6 +956,7 @@ batch membership 由 consuming Op 的 typed inputs 表达；allocator、frontier
 Single-sequence growing KV consumer 使用一个 non-owning typed view。Tensor shape 同时表达 logical
 extent 和所属 pool 的 closed physical order。逻辑字段为：
 
+<!-- // Fork: the typed view carries semantic encoding independently from U8 code storage. -->
 ```text
 PagedKVLayerView
 ├── k_pages           Tensor (route-closed physical axes)
@@ -958,8 +966,8 @@ PagedKVLayerView
 ├── block_table       I32 Tensor [Nlogical]
 ├── head_dim          D
 ├── num_kv_heads      Hkv
-├── dtype             BF16 or I8
-└── quant_group       0 or 64
+├── encoding          BF16, I8-G64, I4-G64, or I4-G128
+└── quant_group       0, 64, or 128
 ```
 
 `P` 和 `Nphysical` 由 route 对 page tensors shape 的解释给出，logical capacity 为
@@ -1025,7 +1033,8 @@ DFlash element_address  = plane_base
 Batched consumer 先使用 `table_rows[b]` 选出 `block_tables[:,table_rows[b]]`，随后执行完全相同的
 logical-block translation；batch axis 不改变 pool layout 或 page ID domain。
 
-INT8 scale 使用 quant group `d/64` 作为第一维坐标，并使用 scale Tensor 自己的 `nb`。一个 key tile
+<!-- // Fork: G selects the closed registered scale plane. -->
+Quantized scale 使用 quant group `d/G` 作为第一维坐标，并使用 scale Tensor 自己的 `nb`。一个 key tile
 取得 `physical_page` 后，同一 pool 的 K、V、code 和 scale 都复用该 page-group ID。Exact strides 由
 §4.2 对该 pool 唯一确定。
 
@@ -1065,7 +1074,7 @@ storage/view boundary。
 |---|---|---|
 | `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
 | `gqa_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
-| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
+| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 registered integer encode |
 | `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
 | `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
 | `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
@@ -1291,6 +1300,7 @@ positions和represented cache values计算结果，不复制production page trav
   继续；
 - BF16 append bit-exact；
 - INT8-G64 code和FP16 scale bits与独立codec oracle一致；
+- I4-G64/I4-G128 packed code和对应FP16 scale bits与各自独立exact codec oracle一致；
 - cached-only route不修改任意cache plane；
 - prefix append的count为0、page边界前后和full count；
 - rejected/provisional stale bytes不进入valid read domain；
@@ -1418,8 +1428,8 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
   `M` 不在 `[M_min,M_max]`，或 minimum/runtime reservation 无法容纳时即拒绝；
 - growing KV 使用 homogeneous pools、pool-local I32 page-group IDs 和 allocation-owned ordered mapping；
 - 全部 registered growing pools 的 page size 为 `P=64`；
-- Main Text/MTP 的 K/V 与 code planes 固定为 contiguous page-major `[D,P,Hkv,Nphysical]`，INT8-G64
-  scale planes 固定为 `[D/64,P,Hkv,Nphysical]`；DFlash Full K/V 固定为 contiguous head-major page-run
+- Main Text/MTP 的 K/V/code planes 固定为 contiguous page-major（packed I4 第一维为 `D/2`），quantized
+  scale planes 固定为 `[D/G,P,Hkv,Nphysical]`；DFlash Full K/V 固定为 contiguous head-major page-run
   `[D,P,Nphysical,Hkv]`；
 - exact strides 由 §4.2 对每个 homogeneous pool 唯一确定；request 和 runtime mode 不选择 order；
 - K/V/code/scale 及同 pool layers 共享一个 page-group ID 和一份 per-sequence block table；

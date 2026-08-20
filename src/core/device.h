@@ -3,8 +3,16 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer {
+
+// Fork: startup graph calibration can recover from one device-allocation exhaustion.
+class CudaOutOfMemory final : public std::runtime_error {
+public:
+    explicit CudaOutOfMemory(std::string message) : std::runtime_error(std::move(message)) {}
+};
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 

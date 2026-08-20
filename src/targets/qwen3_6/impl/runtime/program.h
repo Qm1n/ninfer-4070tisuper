@@ -253,9 +253,13 @@ public:
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;
+    // Fork: calibration Programs measure graph memory on a minimal physical KV payload.
+    const bool graph_calibration;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
+    // Fork: each lane owns one packed pinned-host rewrite-checkpoint GDN image.
+    std::size_t gdn_state_slot_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;
@@ -289,6 +293,8 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    // Fork: cold checkpoint transfers never enter the decode loop.
+    std::optional<PinnedHostBuffer> rewrite_checkpoint_linear_states;
 
     std::size_t workspace_logical_peak_bytes = 0;
 
@@ -300,6 +306,8 @@ private:
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
+    // Fork: resolve the lane-stable pinned-host checkpoint image.
+    [[nodiscard]] void* rewrite_checkpoint_linear_state(std::uint32_t lane) const;
     void copy_round_token();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);

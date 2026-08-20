@@ -16,6 +16,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
+// Fork: I4-G128 is the sole compact-scale encoding; Q quantization remains G64.
+constexpr std::int32_t kI4CompactQuantGroup          = 128;
 constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
@@ -26,7 +28,7 @@ constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 // Fork: packed I4 has a U8 half-width code plane while sharing the G64 scale geometry.
 bool valid_encoding(PagedKVEncoding encoding) noexcept {
     return encoding == PagedKVEncoding::Bf16 || encoding == PagedKVEncoding::I8G64 ||
-           encoding == PagedKVEncoding::I4G64;
+           encoding == PagedKVEncoding::I4G64 || encoding == PagedKVEncoding::I4G128;
 }
 
 bool quantized(PagedKVEncoding encoding) noexcept {
@@ -39,7 +41,14 @@ DType code_dtype(PagedKVEncoding encoding) noexcept {
 }
 
 std::int32_t code_extent(PagedKVEncoding encoding) noexcept {
-    return encoding == PagedKVEncoding::I4G64 ? kHeadDim / 2 : kHeadDim;
+    return (encoding == PagedKVEncoding::I4G64 || encoding == PagedKVEncoding::I4G128)
+               ? kHeadDim / 2
+               : kHeadDim;
+}
+
+// Fork: derive physical scale geometry from the closed semantic encoding.
+std::int32_t quant_group(PagedKVEncoding encoding) noexcept {
+    return encoding == PagedKVEncoding::I4G128 ? kI4CompactQuantGroup : kQuantGroup;
 }
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
@@ -78,8 +87,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.encoding == PagedKVEncoding::Bf16 && cache.quant_group != 0) {
         throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (quantized(cache.encoding) && cache.quant_group != kQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": quantized KV cache must use group 64");
+    if (quantized(cache.encoding) && cache.quant_group != quant_group(cache.encoding)) {
+        throw std::invalid_argument(std::string(op) + ": invalid quantized KV cache group");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -115,7 +124,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const std::int32_t groups = kHeadDim / cache.quant_group;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
@@ -137,8 +146,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     if (cache.encoding == PagedKVEncoding::Bf16 && cache.quant_group != 0) {
         throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (quantized(cache.encoding) && cache.quant_group != kQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": quantized KV cache must use group 64");
+    if (quantized(cache.encoding) && cache.quant_group != quant_group(cache.encoding)) {
+        throw std::invalid_argument(std::string(op) + ": invalid quantized KV cache group");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -175,7 +184,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const std::int32_t groups = kHeadDim / cache.quant_group;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
