@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer Chat</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1c2027; --line:#2b313b; --text:#e8ecf1; --muted:#9aa6b5; --accent:#4c8bf5; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"Segoe UI","Yu Gothic UI",system-ui,sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0 10px 0 0; font-weight:600; letter-spacing:.02em; }
+  label { font-size:12px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  input, select, textarea, button { font:inherit; color:var(--text); background:#11141a; border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+  input[type=text], input:not([type]) { min-width:170px; }
+  input[type=number] { width:80px; }
+  button { background:#232833; cursor:pointer; }
+  button:hover { background:#2b3240; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  #status { font-size:12px; color:var(--muted); margin-left:auto; }
+  #status.ok { color:#7ddc9a; }
+  #status.bad { color:#ff8f8f; }
+  details.settings { margin-top:8px; }
+  details.settings summary { cursor:pointer; font-size:12px; color:var(--muted); }
+  details.settings .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; margin-top:8px; }
+  details.settings textarea { width:100%; min-height:60px; resize:vertical; }
+  main { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:14px; }
+  .msg { max-width:900px; width:100%; margin:0 auto; border:1px solid var(--line); border-radius:10px; padding:10px 12px; background:var(--panel); }
+  .msg .who { font-size:11px; color:var(--muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:.08em; }
+  .msg.user { background:#1a1f27; }
+  .body { white-space:pre-wrap; line-height:1.6; overflow-wrap:anywhere; }
+  pre { background:#0f1217; border:1px solid var(--line); border-radius:8px; padding:10px; overflow-x:auto; }
+  code { font-family:Consolas,"Cascadia Mono",monospace; font-size:13px; }
+  .think { margin-bottom:8px; font-size:13px; color:var(--muted); }
+  .think summary { cursor:pointer; }
+  .cursor::after { content:"▌"; animation:blink 1s steps(2) infinite; color:var(--accent); }
+  @keyframes blink { 50% { opacity:0; } }
+  form { border-top:1px solid var(--line); background:var(--panel); padding:10px 14px; }
+  .composer { max-width:900px; margin:0 auto; display:flex; gap:10px; align-items:flex-end; }
+  #input { flex:1; min-height:46px; max-height:180px; resize:vertical; }
+  .hint { max-width:900px; margin:6px auto 0; font-size:11px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>NInfer Chat</h1>
+    <label>サーバー <input id="baseUrl" type="text" value="http://127.0.0.1:8080/v1"></label>
+    <label>モデル <input id="model" type="text" value="qwen3.8-27b" list="modelList"><datalist id="modelList"></datalist></label>
+    <button id="connect">接続確認</button>
+    <button id="clear">会話を消す</button>
+    <span id="status">未接続</span>
+  </div>
+  <details class="settings">
+    <summary>詳細設定</summary>
+    <div class="grid">
+      <label style="display:block">システムプロンプト<textarea id="system" placeholder="（任意）"></textarea></label>
+      <label>思考モード <input type="checkbox" id="thinking" checked></label>
+      <label>reasoning_effort <select id="effort"><option value="">既定</option><option>none</option><option>minimal</option><option>low</option><option selected>medium</option><option>high</option><option>xhigh</option></select></label>
+      <label>temperature <input type="number" id="temperature" value="1" step="0.05" min="0" max="2"></label>
+      <label>top_p <input type="number" id="topP" value="0.95" step="0.01" min="0" max="1"></label>
+      <label>max_tokens <input type="number" id="maxTokens" value="1024" step="64" min="16"></label>
+    </div>
+  </details>
+</header>
+<main id="chat"></main>
+<form id="composer">
+  <div class="composer">
+    <textarea id="input" rows="2" placeholder="メッセージを入力（Enterで送信 / Shift+Enterで改行）"></textarea>
+    <button class="primary" id="send" type="submit">送信</button>
+    <button id="stop" type="button" disabled>停止</button>
+  </div>
+  <div class="hint">サーバーは CORS 有効で起動してください（run-ninfer-serve.ps1 -Cors / start-chat-ui.bat は自動で設定します）。</div>
+</form>
+<script>
+const els = {
+  baseUrl: document.getElementById("baseUrl"), model: document.getElementById("model"),
+  system: document.getElementById("system"), thinking: document.getElementById("thinking"),
+  effort: document.getElementById("effort"), temperature: document.getElementById("temperature"),
+  topP: document.getElementById("topP"), maxTokens: document.getElementById("maxTokens"),
+  chat: document.getElementById("chat"), input: document.getElementById("input"),
+  send: document.getElementById("send"), stop: document.getElementById("stop"),
+  status: document.getElementById("status"), modelList: document.getElementById("modelList"),
+};
+const STORE = "ninfer-chat-v1";
+let settings = { baseUrl: els.baseUrl.value, model: els.model.value, system: "", thinking: true, effort: "medium", temperature: 1, topP: 0.95, maxTokens: 1024 };
+let history = [];
+let controller = null;
+
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || "null");
+  if (saved) { settings = Object.assign(settings, saved.settings || {}); history = saved.history || []; }
+} catch (error) { console.warn("設定の読み込みに失敗しました", error); }
+
+function persist() {
+  const payload = { settings: { ...settings, baseUrl: els.baseUrl.value, model: els.model.value }, history };
+  try { localStorage.setItem(STORE, JSON.stringify(payload)); } catch (error) {}
+}
+
+function applySettings() {
+  els.baseUrl.value = settings.baseUrl; els.model.value = settings.model;
+  els.system.value = settings.system; els.thinking.checked = settings.thinking;
+  els.effort.value = settings.effort; els.temperature.value = settings.temperature;
+  els.topP.value = settings.topP; els.maxTokens.value = settings.maxTokens;
+}
+
+function readSettings() {
+  settings.baseUrl = els.baseUrl.value.trim().replace(/\/+$/, "");
+  settings.model = els.model.value.trim();
+  settings.system = els.system.value;
+  settings.thinking = els.thinking.checked;
+  settings.effort = els.effort.value;
+  settings.temperature = Number(els.temperature.value) || 0;
+  settings.topP = Number(els.topP.value) || 1;
+  settings.maxTokens = Number(els.maxTokens.value) || 1024;
+}
+
+function setStatus(text, kind) { els.status.textContent = text; els.status.className = kind || ""; }
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// Minimal formatting: fenced code blocks become <pre><code>, the rest stays literal text.
+function renderBody(text) {
+  const parts = text.split(/```/);
+  return parts.map((part, index) => {
+    if (index % 2 === 1) {
+      const trimmed = part.replace(/^[a-zA-Z0-9_+-]*\n/, "");
+      return "<pre><code>" + escapeHtml(trimmed.replace(/\n$/, "")) + "</code></pre>";
+    }
+    return escapeHtml(part);
+  }).join("");
+}
+
+function addBubble(role) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = role === "user" ? "あなた" : "NInfer";
+  const think = document.createElement("details");
+  think.className = "think";
+  think.hidden = true;
+  think.innerHTML = "<summary>思考</summary><div class=\"body\"></div>";
+  const body = document.createElement("div");
+  body.className = "body";
+  wrap.append(who, think, body);
+  els.chat.append(wrap);
+  els.chat.scrollTop = els.chat.scrollHeight;
+  return { wrap, think, thinkBody: think.querySelector("div"), body };
+}
+
+function drawHistory() {
+  els.chat.innerHTML = "";
+  for (const message of history) {
+    const bubble = addBubble(message.role);
+    if (message.reasoning) { bubble.think.hidden = false; bubble.thinkBody.textContent = message.reasoning; }
+    bubble.body.innerHTML = renderBody(message.content || "");
+  }
+}
+
+async function connect() {
+  readSettings();
+  setStatus("接続中…", "");
+  try {
+    const response = await fetch(settings.baseUrl + "/models");
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const data = await response.json();
+    els.modelList.innerHTML = "";
+    for (const entry of data.data || []) {
+      const option = document.createElement("option");
+      option.value = entry.id;
+      els.modelList.append(option);
+    }
+    const ids = (data.data || []).map((entry) => entry.id).join(", ");
+    if (!settings.model && ids) { els.model.value = data.data[0].id; }
+    setStatus("接続OK: " + ids, "ok");
+    persist();
+    return true;
+  } catch (error) {
+    setStatus("接続できません（CORS 有効か確認）: " + error.message, "bad");
+    return false;
+  }
+}
+
+async function send(text) {
+  if (!text.trim()) return;
+  readSettings();
+  const userMessage = { role: "user", content: text };
+  history.push(userMessage);
+  const bubble = addBubble("assistant");
+  const userBubble = addBubble("user");
+  els.chat.insertBefore(userBubble.wrap, bubble.wrap);
+  userBubble.body.textContent = text;
+  els.input.value = "";
+  els.send.disabled = true;
+  els.stop.disabled = false;
+  controller = new AbortController();
+
+  const messages = [];
+  if (settings.system.trim()) messages.push({ role: "system", content: settings.system });
+  for (const message of history) messages.push({ role: message.role, content: message.content });
+
+  const payload = {
+    model: settings.model, messages, stream: true,
+    temperature: settings.temperature, top_p: settings.topP, max_tokens: settings.maxTokens,
+    enable_thinking: settings.thinking,
+  };
+  if (settings.thinking && settings.effort) payload.reasoning_effort = settings.effort;
+
+  let answer = "";
+  let reasoning = "";
+  let failed = false;
+  bubble.body.classList.add("cursor");
+
+  try {
+    const response = await fetch(settings.baseUrl + "/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload), signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      const detail = await response.text().catch(() => "");
+      throw new Error("HTTP " + response.status + " " + detail.slice(0, 300));
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const chunk = buffer.slice(0, boundary).trim();
+        buffer = buffer.slice(boundary + 2);
+        if (chunk.startsWith("data:")) {
+          const data = chunk.slice(5).trim();
+          if (data !== "[DONE]") {
+            try {
+              const parsed = JSON.parse(data);
+              const delta = parsed.choices && parsed.choices[0] && parsed.choices[0].delta;
+              if (delta && delta.reasoning_content) {
+                reasoning += delta.reasoning_content;
+                bubble.think.hidden = false;
+                bubble.thinkBody.textContent = reasoning;
+              }
+              if (delta && delta.content) {
+                answer += delta.content;
+                bubble.body.innerHTML = renderBody(answer);
+              }
+            } catch (error) { console.warn("解析できないチャンク", data); }
+          }
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+      els.chat.scrollTop = els.chat.scrollHeight;
+    }
+  } catch (error) {
+    failed = true;
+    if (error.name === "AbortError") {
+      answer += answer ? "\n\n（停止しました）" : "（停止しました）";
+    } else {
+      answer += (answer ? "\n\n" : "") + "エラー: " + error.message;
+    }
+    bubble.body.innerHTML = renderBody(answer);
+  } finally {
+    bubble.body.classList.remove("cursor");
+    els.send.disabled = false;
+    els.stop.disabled = true;
+    controller = null;
+    if (!failed && answer) history.push({ role: "assistant", content: answer, reasoning });
+    persist();
+  }
+}
+
+els.send.addEventListener("click", (event) => { event.preventDefault(); send(els.input.value); });
+els.input.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(els.input.value); }
+});
+els.stop.addEventListener("click", () => { if (controller) controller.abort(); });
+els.connect.addEventListener("click", connect);
+els.clear.addEventListener("click", () => { history = []; drawHistory(); persist(); });
+for (const element of [els.baseUrl, els.model, els.system, els.thinking, els.effort, els.temperature, els.topP, els.maxTokens]) {
+  element.addEventListener("change", () => { readSettings(); persist(); });
+}
+
+applySettings();
+drawHistory();
+connect();
+</script>
+</body>
+</html>

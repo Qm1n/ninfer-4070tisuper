@@ -15,6 +15,7 @@ param(
     [string]$ApiKey,
     [ValidateSet('bf16', 'int8', 'i4', 'i4-g64')][string]$KvDtype = 'int8',
     [switch]$NoThinking,
+    [switch]$Cors,
     [string]$Exe
 )
 
@@ -78,6 +79,8 @@ $arguments = @(
 )
 if ($ApiKey) { $arguments += @('--api-key', $ApiKey) }
 if ($NoThinking) { $arguments += '--no-thinking' }
+# Browsers need the CORS headers when a local page talks to this server directly.
+if ($Cors) { $arguments += '--cors' }
 
 if ($Profile -eq 'mtp') {
     # MTP reserves extra runtime memory, so the KV pool stays explicit.
