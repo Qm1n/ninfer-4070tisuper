@@ -7,7 +7,7 @@
 # Ctrl+C stops the server.
 
 param(
-    [Parameter(Mandatory = $true)][string]$Model,
+    [string]$Model,
     [int]$Port = 8080,
     [int]$MaxContext = 16384,
     [ValidateSet('plain', 'mtp')][string]$Profile = 'mtp',
@@ -20,10 +20,42 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+
 if (-not $Exe) {
-    $Exe = Join-Path $PSScriptRoot '..\..\build\apps\ninfer-serve.exe'
+    $candidates = @(
+        (Join-Path $repo 'build\apps\ninfer-serve.exe'),
+        (Join-Path $repo '..\build-ninfer-sm89\apps\ninfer-serve.exe')
+    )
+    $Exe = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $Exe) {
+        $Exe = Get-ChildItem -LiteralPath (Join-Path $repo '..') -Directory -Filter 'build*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'apps\ninfer-serve.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+    }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { throw "ninfer-serve.exe was not found: $Exe" }
+
+if (-not $Model) {
+    $artifacts = @()
+    foreach ($directory in @((Join-Path $repo '..\models'), (Join-Path $repo 'models'))) {
+        if (Test-Path -LiteralPath $directory) {
+            $artifacts += Get-ChildItem -LiteralPath $directory -Filter '*.ninfer' -File -ErrorAction SilentlyContinue
+        }
+    }
+    if ($artifacts.Count -eq 1) {
+        $Model = $artifacts[0].FullName
+    }
+    elseif ($artifacts.Count -eq 0) {
+        throw 'no .ninfer artifact was found; pass -Model <path>'
+    }
+    else {
+        Write-Host 'several artifacts were found; pass -Model <path> to choose one:'
+        $artifacts | ForEach-Object { Write-Host ('  ' + $_.FullName) }
+        throw 'ambiguous model artifact'
+    }
+}
 if (-not (Test-Path -LiteralPath $Model)) { throw "model artifact was not found: $Model" }
 
 # cudart64_12.dll lives in the toolkit bin directory and is the only runtime dependency.
