@@ -14,6 +14,7 @@ param(
     [string]$BindHost = '127.0.0.1',
     [string]$ApiKey,
     [ValidateSet('bf16', 'int8', 'i4', 'i4-g64')][string]$KvDtype = 'int8',
+    [ValidateRange(16, 1024)][int]$PrefillChunk = 512,
     [switch]$NoThinking,
     [switch]$Cors,
     [string]$Exe
@@ -75,7 +76,11 @@ $arguments = @(
     '--port', $Port,
     '--max-context', $MaxContext,
     '--kv-capacity', $MaxContext,
-    '--kv-dtype', $KvDtype
+    '--kv-dtype', $KvDtype,
+    # The 1024-token default makes the GDN gating cooperative launch too large on a 16 GB Ada card
+    # (cudaErrorCooperativeLaunchTooLarge) once a prompt passes roughly 3k tokens; 512 fits and is
+    # faster than the smaller chunks the 16 GB profile documents.
+    '--prefill-chunk', $PrefillChunk
 )
 if ($ApiKey) { $arguments += @('--api-key', $ApiKey) }
 if ($NoThinking) { $arguments += '--no-thinking' }

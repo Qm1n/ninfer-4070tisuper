@@ -9,6 +9,7 @@ param(
     [ValidateSet('plain', 'mtp')][string]$Profile = 'mtp',
     [int]$MaxContext = 16384,
     [int]$MaxNew = 512,
+    [ValidateRange(16, 1024)][int]$PrefillChunk = 512,
     [string]$Exe
 )
 
@@ -35,7 +36,8 @@ $arguments = @(
     '--prompt', $Prompt,
     '--max-context', $MaxContext,
     '--kv-capacity', $MaxContext,
-    '--max-new', $MaxNew
+    '--max-new', $MaxNew,
+    '--prefill-chunk', $PrefillChunk
 )
 
 if ($Profile -eq 'mtp') {

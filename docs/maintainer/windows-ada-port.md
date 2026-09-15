@@ -31,20 +31,48 @@ Set -DNINFER_ENABLE_MEDIA=ON on a host that provides both through pkg-config.
 
 ## Measured performance
 
-qwen3_8_27b_minq4.ninfer (Q4-g64 text weights, Q6 embedding) on a 16 GB RTX 4070 Ti SUPER, greedy
-sampling, single request:
+The groupwise-int artifact on a 16 GB RTX 4070 Ti SUPER, greedy sampling, one request at a time.
+Decode is a 256-token generation; prefill covers the prompt only.
 
-| Profile | Context | KV cache | Decode | Prefill | Free after startup |
-| --- | ---: | --- | ---: | ---: | ---: |
-| plain | 8,192 | int8 group-64 | 34.2 tok/s | 309 tok/s | 1.34 GiB |
-| MTP3 | 16,384 | int8 group-64 | 81.0 tok/s | 326 tok/s | 0.29 GiB |
-| MTP3 | 32,768 | int4 group-128 | 75.1 tok/s | 296 tok/s | 0.45 GiB |
+| Profile | Context | KV | Prompt | Prefill | Decode | MTP acceptance | Free after startup |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| plain | 8,192 | int8 | 24 tok | 162 tok/s | 34.1 tok/s | - | 1.33 GiB |
+| MTP3 | 16,384 | int8 | 24 tok | 157 tok/s | 73.0 tok/s | 60.0% | 0.30 GiB |
+| MTP3 | 32,768 | int4 | 24 tok | 160 tok/s | 70.8 tok/s | 55.6% | 0.31 GiB |
+| plain | 32,768 | int4 | 12.4k tok | 1,085 tok/s | 33.1 tok/s | - | 1.14 GiB |
+| plain | 32,768 | int4 | 18.5k tok | 1,059 tok/s | 32.6 tok/s | - | 1.16 GiB |
+| MTP3 | 32,768 | int4 | 12.4k tok | 1,052 tok/s | 61.3 tok/s | 58.3% | 0.36 GiB |
+| plain | 49,152 | int4 | 8 tok | - | 34.0 tok/s | - | 0.92 GiB |
+| plain | 65,536 | int4 | 8 tok | - | 34.1 tok/s | - | 0.65 GiB |
+| plain | 98,304 | int4 | 8 tok | - | 32.9 tok/s | - | 0.12 GiB |
 
-MTP acceptance was 71.7% (16K, int8) and 63.6% (32K, int4) at a draft window of three tokens.
-Weight residency is 12.71 GiB plain and 13.47 GiB with the MTP package loaded, leaving roughly
-1.1-1.9 GiB free after weights. MTP additionally reserves 940 MiB of runtime memory, so automatic
-KV sizing refuses configurations that would leave no headroom; pass an explicit --kv-capacity for
-MTP profiles.
+Short prompts report a low prefill rate because fixed launch and graph overhead dominates a handful
+of tokens; the same engine sustains roughly 1.0-1.1k tok/s once a prompt has thousands of tokens.
+Decode stays in a 33-34 tok/s band from 8k to 96k context with int4 KV, and the MTP draft window of
+three tokens roughly doubles it whenever acceptance stays above 55%.
+
+Weight residency is 12.71 GiB plain and 13.47 GiB with the MTP package, leaving 1.1-1.9 GiB free
+after weights depending on what else the desktop uses. MTP adds a 940 MiB runtime reservation, so
+automatic KV sizing refuses those profiles; pass an explicit --kv-capacity. With int4 KV the
+largest context that fits here is between 96k (works, 0.12 GiB free) and 112k (rejected); 131k
+needs 2.49 GB of runtime capacity against 2.19 GB available after weights.
+
+### Prefill chunking
+
+The engine default of a 1024-token prefill chunk exceeds the cooperative-launch limit of the GDN
+gating projection on this card: prompts above roughly 3k tokens fail with
+cudaErrorCooperativeLaunchTooLarge. The chunk has to come down, and larger chunks are also faster,
+so 512 is the practical choice.
+
+| --prefill-chunk | Prefill (3,151-token prompt) |
+| ---: | ---: |
+| 64 | 456 tok/s |
+| 128 | 863 tok/s |
+| 256 | 985 tok/s |
+| 512 | 1,061 tok/s |
+| 1024 (default) | fails |
+
+Both Windows launch scripts pass --prefill-chunk 512 for this reason.
 
 ## Differences from the sm_86 fork
 
