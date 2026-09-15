@@ -37,6 +37,7 @@
   .think summary { cursor:pointer; }
   .cursor::after { content:"▌"; animation:blink 1s steps(2) infinite; color:var(--accent); }
   @keyframes blink { 50% { opacity:0; } }
+  .note { margin-top:8px; font-size:12px; color:#ffcf8f; }
   form { border-top:1px solid var(--line); background:var(--panel); padding:10px 14px; }
   .composer { max-width:900px; margin:0 auto; display:flex; gap:10px; align-items:flex-end; }
   #input { flex:1; min-height:46px; max-height:180px; resize:vertical; }
@@ -61,7 +62,7 @@
       <label>reasoning_effort <select id="effort"><option value="">既定</option><option>none</option><option>minimal</option><option>low</option><option selected>medium</option><option>high</option><option>xhigh</option></select></label>
       <label>temperature <input type="number" id="temperature" value="1" step="0.05" min="0" max="2"></label>
       <label>top_p <input type="number" id="topP" value="0.95" step="0.01" min="0" max="1"></label>
-      <label>max_tokens <input type="number" id="maxTokens" value="1024" step="64" min="16"></label>
+      <label>max_tokens <input type="number" id="maxTokens" value="8192" step="64" min="16" placeholder="空欄=サーバー既定"></label>
     </div>
   </details>
 </header>
@@ -84,8 +85,9 @@ const els = {
   send: document.getElementById("send"), stop: document.getElementById("stop"),
   status: document.getElementById("status"), modelList: document.getElementById("modelList"),
 };
-const STORE = "ninfer-chat-v1";
-let settings = { baseUrl: els.baseUrl.value, model: els.model.value, system: "", thinking: true, effort: "medium", temperature: 1, topP: 0.95, maxTokens: 1024 };
+const STORE = "ninfer-chat-v2";
+// 8192 matches the serving default (kDefaultMaxTokens); an empty field omits max_tokens entirely.
+let settings = { baseUrl: els.baseUrl.value, model: els.model.value, system: "", thinking: true, effort: "medium", temperature: 1, topP: 0.95, maxTokens: 8192 };
 let history = [];
 let controller = null;
 
@@ -114,7 +116,8 @@ function readSettings() {
   settings.effort = els.effort.value;
   settings.temperature = Number(els.temperature.value) || 0;
   settings.topP = Number(els.topP.value) || 1;
-  settings.maxTokens = Number(els.maxTokens.value) || 1024;
+  const rawMaxTokens = els.maxTokens.value.trim();
+  settings.maxTokens = rawMaxTokens === "" ? null : Math.max(1, Number(rawMaxTokens) || 8192);
 }
 
 function setStatus(text, kind) { els.status.textContent = text; els.status.className = kind || ""; }
@@ -147,10 +150,13 @@ function addBubble(role) {
   think.innerHTML = "<summary>思考</summary><div class=\"body\"></div>";
   const body = document.createElement("div");
   body.className = "body";
-  wrap.append(who, think, body);
+  const note = document.createElement("div");
+  note.className = "note";
+  note.hidden = true;
+  wrap.append(who, think, body, note);
   els.chat.append(wrap);
   els.chat.scrollTop = els.chat.scrollHeight;
-  return { wrap, think, thinkBody: think.querySelector("div"), body };
+  return { wrap, think, thinkBody: think.querySelector("div"), body, note };
 }
 
 function drawHistory() {
@@ -206,13 +212,15 @@ async function send(text) {
 
   const payload = {
     model: settings.model, messages, stream: true,
-    temperature: settings.temperature, top_p: settings.topP, max_tokens: settings.maxTokens,
+    temperature: settings.temperature, top_p: settings.topP,
     enable_thinking: settings.thinking,
   };
+  if (settings.maxTokens) payload.max_tokens = settings.maxTokens;
   if (settings.thinking && settings.effort) payload.reasoning_effort = settings.effort;
 
   let answer = "";
   let reasoning = "";
+  let finishReason = null;
   let failed = false;
   bubble.body.classList.add("cursor");
 
@@ -242,6 +250,9 @@ async function send(text) {
             try {
               const parsed = JSON.parse(data);
               const delta = parsed.choices && parsed.choices[0] && parsed.choices[0].delta;
+              if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) {
+                finishReason = parsed.choices[0].finish_reason;
+              }
               if (delta && delta.reasoning_content) {
                 reasoning += delta.reasoning_content;
                 bubble.think.hidden = false;
@@ -272,6 +283,10 @@ async function send(text) {
     els.stop.disabled = true;
     controller = null;
     if (!failed && answer) history.push({ role: "assistant", content: answer, reasoning });
+    if (finishReason === "length") {
+      bubble.note.hidden = false;
+      bubble.note.textContent = "⚠ 出力上限に達して打ち切られました。max_tokens を増やすか、思考モードをオフにしてください。";
+    }
     persist();
   }
 }
