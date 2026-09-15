@@ -56,7 +56,8 @@ void launch_gemv_residual(const Tensor& x, const Weight& w, Tensor& residual_out
     const std::int32_t k    = x.ne[0];
     const auto launch = [&]<class Schedule>() {
         const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kRowsPerCta)), 1u, 1u);
-        constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
+        // Fork: nvcc's front end rejects a constexpr dim3 (the type is not literal to it).
+        const dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
         q4_rowsplit_gemv_kernel<Schedule, false, 0, Q4GemvResidualEpilogue>
             <<<grid, block, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),

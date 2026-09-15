@@ -16,6 +16,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 namespace ninfer::ops::detail {
@@ -52,6 +53,23 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
     return result.bits;
 }
 
+// Fork: shared staging for one w8_small_t_mma_kernel launch, sized from its schedule so the host
+// launcher can request the same dynamic allocation the kernel body maps.
+template <class Schedule>
+union W8SmallTSharedStorage {
+    struct {
+        std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kGroupK];
+        __nv_bfloat16 activations[Schedule::kKWarps][Schedule::kTileTokens *
+                                                     Schedule::kTileKPerWarp];
+        std::uint8_t scales[Schedule::kRowsPerCta]
+                            [Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                                 ? Schedule::kScaleBytesPerRow
+                                 : 1];
+    } staging;
+
+    float partial[Schedule::kKWarps * (Schedule::kTileTokens / 8) * 32 * 4];
+};
+
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
           bool DirectPairEpilogue = false>
@@ -74,19 +92,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
-    union SharedStorage {
-        struct {
-            std::uint8_t codes[kMmaRows][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint8_t scales[kMmaRows][Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
-                                              ? Schedule::kScaleBytesPerRow
-                                              : 1];
-        } staging;
-
-        float partial[kWarps * kNt * 32 * 4];
-    };
-
-    __shared__ __align__(16) SharedStorage shared;
+    // Fork: production schedules need up to 65 KiB, which exceeds the 48 KiB static shared-memory
+    // limit on every architecture, so the staging union lives in the opt-in dynamic allocation
+    // requested by launch_w8_small_t_mma().
+    extern __shared__ __align__(16) unsigned char w8_small_t_dynamic_shared[];
+    auto& shared =
+        *reinterpret_cast<W8SmallTSharedStorage<Schedule>*>(w8_small_t_dynamic_shared);
     auto& code_shared  = shared.staging.codes;
     auto& b_shared     = shared.staging.activations;
     auto& scale_shared = shared.staging.scales;
@@ -342,6 +353,37 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             }
         }
     }
+}
+
+// Fork: launches the exact-small-T kernel through the opt-in dynamic shared-memory path. The
+// attribute is set once per kernel instantiation; every architecture that reaches this code
+// allows at least 99 KiB per block, which covers the largest production schedule.
+template <class Geometry, int ActiveCols, class Schedule, class Output,
+          class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
+          bool DirectPairEpilogue = false>
+void launch_w8_small_t_mma(const dim3& grid, cudaStream_t stream, const __nv_bfloat16* x,
+                           const std::uint8_t* codes, const std::uint8_t* scales, Output output,
+                           Epilogue epilogue = {}, RowPolicy row_policy = {}) {
+    constexpr int kSharedBytes = static_cast<int>(sizeof(W8SmallTSharedStorage<Schedule>));
+    static_assert(kSharedBytes <= 227 * 1024, "w8 small-T schedule exceeds the device ceiling");
+    if (kSharedBytes > 99 * 1024) {
+        // Fork: Ampere and Ada allow 99 KiB of opt-in shared memory per block; only the widest W8
+        // tiles exceed that, and no groupwise artifact this build targets selects them.
+        throw std::invalid_argument(
+            "w8 exact-small-T schedule requires more shared memory than this GPU provides");
+    }
+    auto* kernel = &w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, Output, Epilogue,
+                                          RowPolicy, DirectPairEpilogue>;
+    static const bool configured = [kernel] {
+        if (kSharedBytes > 48 * 1024) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+        }
+        return true;
+    }();
+    (void)configured;
+    kernel<<<grid, Schedule::kThreads, kSharedBytes, stream>>>(x, codes, scales, output, epilogue,
+                                                               row_policy);
 }
 
 } // namespace ninfer::ops::detail

@@ -32,7 +32,18 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC CUDA::cudart Threads::Threads)
+
+# Fork: CUDA 12.8 for Windows ships no NVTX headers or import library. Instrumented call sites
+# stay in place; when the toolkit has no NVTX they resolve against the no-op shim header.
+find_path(NINFER_NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
+if(NINFER_NVTX_INCLUDE_DIR)
+  target_link_libraries(ninfer_core PUBLIC CUDA::nvtx3)
+else()
+  message(STATUS "NInfer: NVTX headers not found; using the no-op instrumentation shim")
+  target_include_directories(ninfer_core PUBLIC
+    ${PROJECT_SOURCE_DIR}/third_party/nvtx_shim)
+endif()
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -226,18 +237,34 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+# Fork: the in-tree copy is linked statically, so MSVC must not see an import decoration.
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
 
-add_library(ninfer_media_decode STATIC
-  media/decode/decode.cpp)
-ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+# Fork: FFmpeg-backed decode, or a stub that reports the missing capability. Both satisfy the
+# same decode contract, so the text-only build keeps the image path well-defined.
+if(NINFER_ENABLE_MEDIA)
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+else()
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode_unsupported.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+endif()
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC
-    product/media_acquire/acquire.cpp)
-  ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(NINFER_ENABLE_MEDIA)
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire.cpp)
+    ninfer_internal_includes(ninfer_media_acquire)
+    target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  else()
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire_unsupported.cpp)
+    ninfer_internal_includes(ninfer_media_acquire)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

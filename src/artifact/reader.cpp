@@ -15,10 +15,20 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace ninfer::artifact {
 namespace {
@@ -181,6 +191,53 @@ struct TransparentStringHash {
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
+#ifdef _WIN32
+        handle_ = ::CreateFileW(path.wstring().c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                                    "open " + path.string());
+        }
+
+        LARGE_INTEGER size{};
+        if (::GetFileSizeEx(handle_, &size) == 0) {
+            const int error = static_cast<int>(::GetLastError());
+            ::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            throw std::system_error(error, std::system_category(), "size " + path.string());
+        }
+        if (size.QuadPart < 0 ||
+            static_cast<std::uintmax_t>(size.QuadPart) >
+                std::numeric_limits<std::size_t>::max()) {
+            ::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+
+        size_ = static_cast<std::size_t>(size.QuadPart);
+        if (size_ != 0) {
+            // A read-only view keeps the zero-copy payload spans the Linux build gets from mmap.
+            mapping_ = ::CreateFileMappingW(handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (mapping_ == nullptr) {
+                const int error = static_cast<int>(::GetLastError());
+                ::CloseHandle(handle_);
+                handle_ = INVALID_HANDLE_VALUE;
+                throw std::system_error(error, std::system_category(), "map " + path.string());
+            }
+            view_ = ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+            if (view_ == nullptr) {
+                const int error = static_cast<int>(::GetLastError());
+                ::CloseHandle(mapping_);
+                ::CloseHandle(handle_);
+                mapping_ = nullptr;
+                handle_  = INVALID_HANDLE_VALUE;
+                throw std::system_error(error, std::system_category(), "view " + path.string());
+            }
+            data_ = static_cast<const std::byte*>(view_);
+        }
+        return;
+#else
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
@@ -212,11 +269,18 @@ public:
         fd_   = fd;
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
+#endif
     }
 
     ~MappedFile() {
+#ifdef _WIN32
+        if (view_ != nullptr) { ::UnmapViewOfFile(view_); }
+        if (mapping_ != nullptr) { ::CloseHandle(mapping_); }
+        if (handle_ != INVALID_HANDLE_VALUE) { ::CloseHandle(handle_); }
+#else
         if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
         if (fd_ >= 0) { ::close(fd_); }
+#endif
     }
 
     MappedFile(const MappedFile&)            = delete;
@@ -232,6 +296,30 @@ public:
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
             throw ArtifactError("direct artifact read is not 4096-byte aligned");
         }
+#ifdef _WIN32
+        // Windows supports the same positional, uncached intent through FILE_FLAG_NO_BUFFERING,
+        // but that also demands sector-aligned transfer granularity that the caller's 4096-byte
+        // contract does not guarantee on every volume. Buffered positioned reads keep the call
+        // contract and stay chunked below the 32-bit transfer limit.
+        constexpr std::size_t kChunkBytes = 1ULL << 30;
+        std::size_t total                 = 0;
+        while (total < destination.size()) {
+            const std::size_t count = std::min(destination.size() - total, kChunkBytes);
+            const std::uint64_t offset = absolute_offset + total;
+            OVERLAPPED overlapped{};
+            overlapped.Offset     = static_cast<DWORD>(offset & 0xFFFFFFFFULL);
+            overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+            DWORD read            = 0;
+            if (::ReadFile(handle_, destination.data() + total, static_cast<DWORD>(count), &read,
+                           &overlapped) == 0) {
+                throw std::system_error(static_cast<int>(::GetLastError()),
+                                        std::system_category(), "direct artifact read");
+            }
+            if (read == 0) { break; }
+            total += static_cast<std::size_t>(read);
+        }
+        return total;
+#else
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
@@ -246,10 +334,17 @@ public:
             throw std::system_error(errno, std::generic_category(), "direct artifact read");
         }
         return static_cast<std::size_t>(bytes);
+#endif
     }
 
 private:
+#ifdef _WIN32
+    HANDLE handle_         = INVALID_HANDLE_VALUE;
+    HANDLE mapping_        = nullptr;
+    void* view_            = nullptr;
+#else
     int fd_                = -1;
+#endif
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
 };

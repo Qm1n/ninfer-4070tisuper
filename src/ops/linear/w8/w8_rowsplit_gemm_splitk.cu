@@ -39,11 +39,11 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
     using Schedule = W8SmallTMmaSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;
     static_assert((kRows % kRowsPerCta) == 0);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
-    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+    launch_w8_small_t_mma<Geometry, ActiveCols, Schedule>(
+        dim3(static_cast<unsigned>(kRows / kRowsPerCta)), stream,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output);
 }
 
 template <std::size_t... Offsets>
@@ -65,10 +65,10 @@ void require_problem(const Tensor& x, const Weight& w, const Tensor& out) {
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
-    w8_rowsplit_medium_t_splitk_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), output, x.ne[1]);
+    launch_w8_rowsplit_medium_t_splitk<kHidden, TileCols, KSplits, NGroups, MinBlocks>(
+        dim3(static_cast<unsigned>(kRows / kRowsPerCta)), stream, x.ne[1],
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), output);
 }
 
 } // namespace

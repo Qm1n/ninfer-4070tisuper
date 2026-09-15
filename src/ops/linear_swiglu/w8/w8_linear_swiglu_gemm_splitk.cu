@@ -64,11 +64,11 @@ void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
     const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluExactTRows row_policy{kIntermediate};
-    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
-                          W8SwiGluExactTEpilogue, W8SwiGluExactTRows, true>
-        <<<kIntermediate / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
+    launch_w8_small_t_mma<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SwiGluExactTEpilogue, W8SwiGluExactTRows, true>(
+        dim3(static_cast<unsigned>(kIntermediate / kRowsPerCta)), stream,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
 }
 
 template <std::size_t... Offsets>

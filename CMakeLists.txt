@@ -10,10 +10,12 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
-# Fork: CUDA 12.4's gcc-13 toolchain dir leaks -L/usr/lib/gcc/x86_64-linux-gnu/13 into
-# every CUDA link, whose older libstdc++.so shadows the system one and lacks
-# __cxa_call_terminate. Link the real runtime by absolute path so it wins.
-link_libraries(/usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+if(UNIX AND NOT APPLE)
+  # Fork: CUDA 12.4's gcc-13 toolchain dir leaks -L/usr/lib/gcc/x86_64-linux-gnu/13 into
+  # every CUDA link, whose older libstdc++.so shadows the system one and lacks
+  # __cxa_call_terminate. Link the real runtime by absolute path so it wins.
+  link_libraries(/usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+endif()
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
@@ -55,14 +57,29 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_SERVE ON)
 endif()
 
-find_package(CUDAToolkit REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-  libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
-if(NINFER_BUILD_MEDIA_ACQUIRE)
-  pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+# Fork: image/video decoding (FFmpeg) and remote media acquisition (libcurl) are optional.
+# Text generation, serving, and the artifact loader use neither, so hosts without those
+# development packages build the text-only media stubs instead. Windows has no default
+# pkg-config supply, so the option defaults off there.
+if(WIN32)
+  set(NINFER_ENABLE_MEDIA_DEFAULT OFF)
+else()
+  set(NINFER_ENABLE_MEDIA_DEFAULT ON)
 endif()
+option(NINFER_ENABLE_MEDIA "Enable FFmpeg decode and libcurl media acquisition"
+       ${NINFER_ENABLE_MEDIA_DEFAULT})
+
+find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
+
+if(NINFER_ENABLE_MEDIA)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+  if(NINFER_BUILD_MEDIA_ACQUIRE)
+    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  endif()
+endif()
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

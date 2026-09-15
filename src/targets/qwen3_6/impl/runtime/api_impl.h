@@ -97,10 +97,16 @@ SequencePlanner<Variant>::SequencePlanner(
     std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
+// Fork: MSVC does not emit out-of-class "= default" specializations of these members, so the move
+// operations are written out explicitly instead.
 template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 SequencePlanner<Variant>::~SequencePlanner() = default;
 
@@ -138,9 +144,14 @@ RequestBasePlan<Variant>::RequestBasePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>&
+RequestBasePlan<Variant>::operator=(RequestBasePlan<Variant>&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
@@ -155,9 +166,12 @@ RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Varian
     : impl_(std::move(impl)) {}
 
 template <>
-RequestPlan<Variant>::RequestPlan(RequestPlan&&) noexcept = default;
+RequestPlan<Variant>::RequestPlan(RequestPlan&& other) noexcept : impl_(std::move(other.impl_)) {}
 template <>
-RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&&) noexcept = default;
+RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan<Variant>&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 RequestPlan<Variant>::~RequestPlan() = default;
 

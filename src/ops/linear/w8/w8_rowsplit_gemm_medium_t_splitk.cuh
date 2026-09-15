@@ -13,6 +13,22 @@
 
 namespace ninfer::ops::detail {
 
+// Fork: staging for one w8_rowsplit_medium_t_splitk_kernel launch, sized from its schedule so the
+// host launcher can request the same dynamic allocation the kernel body maps.
+template <int TileCols, int KSplits, int NGroups>
+struct W8RowsplitMediumTSharedStorage {
+    static constexpr int kTileK       = 64;
+    static constexpr int kMmaRows     = 16;
+    static constexpr int kKernelWarps = KSplits * NGroups;
+    static constexpr int kGroupK      = KSplits * kTileK;
+    static constexpr int kWarpCols    = TileCols / NGroups;
+
+    struct {
+        std::uint8_t codes[kMmaRows][kGroupK];
+        __nv_bfloat16 activations[kKernelWarps][kWarpCols * kTileK];
+    } staging;
+};
+
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
           bool AddResidual = false>
 __global__
@@ -32,8 +48,15 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
     static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
 
-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+    // Fork: the widest medium-T tiles exceed the 48 KiB static shared-memory limit on every
+    // architecture, so staging lives in the opt-in dynamic allocation requested by
+    // launch_w8_rowsplit_medium_t_splitk().
+    extern __shared__ __align__(16) unsigned char w8_medium_t_dynamic_shared[];
+    auto& w8_medium_t_storage =
+        *reinterpret_cast<W8RowsplitMediumTSharedStorage<TileCols, KSplits, NGroups>*>(
+            w8_medium_t_dynamic_shared);
+    auto& code_shared = w8_medium_t_storage.staging.codes;
+    auto& b_shared    = w8_medium_t_storage.staging.activations;
 
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;
@@ -229,6 +252,34 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
             }
         }
     }
+}
+
+// Fork: launches the medium-T split-K kernel through the opt-in dynamic shared-memory path. The
+// attribute is set once per kernel instantiation before its first launch.
+template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
+          bool AddResidual = false>
+void launch_w8_rowsplit_medium_t_splitk(const dim3& grid, cudaStream_t stream, int active_cols,
+                                        const __nv_bfloat16* x, const std::uint8_t* codes,
+                                        const std::uint8_t* scales, Output output) {
+    constexpr int kSharedBytes =
+        static_cast<int>(sizeof(W8RowsplitMediumTSharedStorage<TileCols, KSplits, NGroups>));
+    static_assert(kSharedBytes <= 227 * 1024, "w8 medium-T schedule exceeds the device ceiling");
+    if (kSharedBytes > 99 * 1024) {
+        throw std::invalid_argument(
+            "w8 medium-T split-K schedule requires more shared memory than this GPU provides");
+    }
+    auto* kernel = &w8_rowsplit_medium_t_splitk_kernel<Hidden, TileCols, KSplits, NGroups,
+                                                       MinBlocks, Output, AddResidual>;
+    static const bool configured = [kernel] {
+        if (kSharedBytes > 48 * 1024) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+        }
+        return true;
+    }();
+    (void)configured;
+    kernel<<<grid, KSplits * NGroups * 32, kSharedBytes, stream>>>(x, codes, scales, output,
+                                                                   active_cols);
 }
 
 } // namespace ninfer::ops::detail

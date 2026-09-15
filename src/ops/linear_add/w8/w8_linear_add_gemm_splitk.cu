@@ -40,12 +40,12 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
     static_assert((kRows % kRowsPerCta) == 0);
     auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
     const W8ContiguousOutput output{residual, kRows};
-    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
-                          W8SmallTMmaResidualEpilogue>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaResidualEpilogue{});
+    launch_w8_small_t_mma<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SmallTMmaResidualEpilogue>(
+        dim3(static_cast<unsigned>(kRows / kRowsPerCta)), stream,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaResidualEpilogue{});
 }
 
 template <int Hidden, std::size_t... Offsets>
@@ -63,12 +63,12 @@ template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
                    cudaStream_t stream) {
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual_out.data), kRows};
-    w8_rowsplit_medium_t_splitk_kernel<Hidden, TileCols, KSplits, NGroups, MinBlocks,
-                                       W8ContiguousOutput, true>
-        <<<kRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+    launch_w8_rowsplit_medium_t_splitk<Hidden, TileCols, KSplits, NGroups, MinBlocks,
+                                       W8ContiguousOutput, true>(
+        dim3(static_cast<unsigned>(kRows / kRowsPerCta)), stream, x.ne[1],
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output);
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>

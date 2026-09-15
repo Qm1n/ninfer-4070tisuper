@@ -1,5 +1,7 @@
 #include "serve/console_log.h"
 
+#include "runtime/support/host_platform.h"
+
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -38,7 +40,7 @@ std::string format_console_log_prefix(std::chrono::system_clock::time_point time
     const std::time_t wall_seconds =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::time_point(whole_seconds));
     std::tm local{};
-    localtime_r(&wall_seconds, &local);
+    runtime::support::local_time(wall_seconds, local);
 
     std::ostringstream out;
     out << '[' << std::put_time(&local, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0')
