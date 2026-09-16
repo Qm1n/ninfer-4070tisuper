@@ -7,6 +7,7 @@
 // the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
 // optional caller epilogue may instead consume the FP32 tile.
 
+#include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/w8/w8_config.h"
@@ -376,8 +377,9 @@ void launch_w8_small_t_mma(const dim3& grid, cudaStream_t stream, const __nv_bfl
                                           RowPolicy, DirectPairEpilogue>;
     static const bool configured = [kernel] {
         if (kSharedBytes > 48 * 1024) {
-            cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            kSharedBytes));
         }
         return true;
     }();

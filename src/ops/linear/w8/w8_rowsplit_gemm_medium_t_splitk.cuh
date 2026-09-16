@@ -272,8 +272,9 @@ void launch_w8_rowsplit_medium_t_splitk(const dim3& grid, cudaStream_t stream, i
                                                        MinBlocks, Output, AddResidual>;
     static const bool configured = [kernel] {
         if (kSharedBytes > 48 * 1024) {
-            cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            kSharedBytes));
         }
         return true;
     }();

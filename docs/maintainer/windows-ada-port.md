@@ -20,7 +20,7 @@ directory, so put that directory on PATH before starting ninfer.exe.
 
     call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
     cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DBUILD_TESTING=OFF
-    cmake --build build --parallel
+    cmake --build build -j
 
 Artifacts land in build/apps/ninfer.exe and build/apps/ninfer-serve.exe.
 
@@ -74,6 +74,16 @@ so 512 is the practical choice.
 
 Both Windows launch scripts pass --prefill-chunk 512 for this reason.
 
+## Windows launch helpers
+
+- `run-ninfer.ps1` and `run-ninfer-serve.ps1` first use `build/apps`, then the repository-adjacent
+  `build-ninfer-sm89/apps` directory used by this port. Pass `-Exe` for any other build directory.
+- If `CUDA_PATH` is unset or does not contain `cudart64_12.dll`, the helpers try the standard CUDA
+  12.8 installation directory and otherwise report a setup error before launching NInfer.
+- `start-chat-ui.ps1` owns both child processes: it stops the static UI server when NInfer exits and
+  also cleans up both processes after an error or Ctrl+C.
+- The `.bat` wrappers forward all arguments to their PowerShell scripts.
+
 ## Differences from the sm_86 fork
 
 - CMakeLists.txt: the absolute libstdc++ link applies to UNIX only, and FFmpeg/libcurl become
@@ -85,7 +95,7 @@ Both Windows launch scripts pass --prefill-chunk 512 for this reason.
 - src/runtime/support/host_platform.h (new): terminal, process, and calendar queries for both
   platforms.
 - src/media/decode/decode_unsupported.cpp and src/product/media_acquire/acquire_unsupported.cpp
-  (new): media stubs that keep local paths, inline data, and byte sources working.
+  (new): media stubs that reject image/video input before reading files or expanding inline data.
 - third_party/nvtx_shim/: no-op NVTX header used when the toolkit ships no NVTX (CUDA 12.8 for
   Windows ships neither the headers nor the import library).
 - src/ops/linear/w8/: the exact-small-T and medium-T split-K kernels stage through opt-in dynamic

@@ -30,6 +30,7 @@ The executable `--help` output is the exact source for command-line option spell
 - [Tests](../tests/README.md)
 - [Maintainer tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
+- [Windows / Ada build and measured 16 GB profile](maintainer/windows-ada-port.md)
 
 ## Maintainer references
 
@@ -51,6 +52,7 @@ Artifact and model references:
 - [Persistent tensor numeric formats](maintainer/tensor-formats.md)
 - [Persistent storage layouts](maintainer/storage-layouts.md)
 - [GGUF conversion](maintainer/gguf-conversion.md)
+- [Windows / Ada port](maintainer/windows-ada-port.md)
 - [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
 - [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)

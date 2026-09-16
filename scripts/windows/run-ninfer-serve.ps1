@@ -30,14 +30,10 @@ if (-not $Exe) {
         (Join-Path $repo '..\build-ninfer-sm89\apps\ninfer-serve.exe')
     )
     $Exe = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if (-not $Exe) {
-        $Exe = Get-ChildItem -LiteralPath (Join-Path $repo '..') -Directory -Filter 'build*' -ErrorAction SilentlyContinue |
-            ForEach-Object { Join-Path $_.FullName 'apps\ninfer-serve.exe' } |
-            Where-Object { Test-Path -LiteralPath $_ } |
-            Select-Object -First 1
-    }
 }
-if (-not (Test-Path -LiteralPath $Exe)) { throw "ninfer-serve.exe was not found: $Exe" }
+if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) {
+    throw 'ninfer-serve.exe was not found; build the project or pass -Exe <path>'
+}
 
 if (-not $Model) {
     $artifacts = @()
@@ -61,8 +57,8 @@ if (-not $Model) {
 if (-not (Test-Path -LiteralPath $Model)) { throw "model artifact was not found: $Model" }
 
 # cudart64_12.dll lives in the toolkit bin directory and is the only runtime dependency.
-$cudaBin = Join-Path $env:CUDA_PATH 'bin'
-if (-not (Test-Path -LiteralPath (Join-Path $cudaBin 'cudart64_12.dll'))) {
+$cudaBin = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'bin' } else { $null }
+if (-not $cudaBin -or -not (Test-Path -LiteralPath (Join-Path $cudaBin 'cudart64_12.dll'))) {
     $cudaBin = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin'
 }
 if (-not (Test-Path -LiteralPath (Join-Path $cudaBin 'cudart64_12.dll'))) {

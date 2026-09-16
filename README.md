@@ -2,19 +2,50 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
+NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints.
+Upstream targets a single NVIDIA GeForce RTX 5090; this fork also supports the Windows/Ada setup
+described below. It runs prompts through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs.
 
-> **Fork note (A5000 / sm_86):** this fork ports the groupwise-int execution paths to any
-> sm_80+ GPU (built and measured on a 16 GB RTX A5000 Laptop, CUDA 12.4), adds new Q4
-> kernels (residual linear_add, Q4/Q4 fused input projections, wide-K GEMV), INT4-G64/G128
-> KV caches, pinned-host tensor placement, and graph-allowance calibration. The nvfp4/fp8
-> profiles remain Blackwell-only (stubbed out below sm_89). It ships a custom min-Q4
-> Qwen3.8-27B artifact tuned for 16 GB cards:
-> **[aaaljaz/qwen3.8-27b-ninfer-minq4](https://huggingface.co/aaaljaz/qwen3.8-27b-ninfer-minq4)**
-> — 131k-token plain context (12.6 tok/s), 122,880 with MTP3 (22.4 tok/s), 49k at 25.7 tok/s.
-> Every change is marked `// Fork:`; upstream 5090 behavior is unchanged.
+> **Fork note (16 GB Ampere/Ada):** this fork carries the sm_86 groupwise-int work and adds a
+> native Windows sm_89 build measured on an RTX 4070 Ti SUPER. It can convert a distributed
+> Qwen3.8-27B GGUF plus its vision projector into the registered min-Q4 `.ninfer` artifact, then
+> run the CLI, OpenAI-compatible server, or bundled browser UI without WSL. NVFP4/FP8 profiles
+> remain Blackwell-only. See the [Windows/Ada guide](docs/maintainer/windows-ada-port.md) and
+> [GGUF conversion guide](docs/maintainer/gguf-conversion.md) for the exact contracts and results.
+
+## Windows / RTX 4070 Ti SUPER quick start
+
+The completed Windows port and GGUF converter are on the `gguf-converter` branch. In a Visual
+Studio 2022 Developer Command Prompt, build the text-only sm_89 binaries:
+
+```bat
+git switch gguf-converter
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DBUILD_TESTING=OFF
+cmake --build build -j
+```
+
+Convert the local GGUF from PowerShell. `-Frontend` is a Qwen3.8-27B directory containing the
+official `config.json`, tokenizer, templates, and preprocessor resources:
+
+```powershell
+.\scripts\windows\convert-gguf.ps1 `
+  -Frontend C:\models\Qwen3.8-27B `
+  -Gguf C:\models\Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf `
+  -Mmproj C:\models\mmproj-Qwen3.8-27B-BF16.gguf `
+  -Out C:\models\qwen3_8_27b_gguf.ninfer
+```
+
+Double-click the launcher or pass the artifact explicitly. Closing the model-server window stops
+both local servers:
+
+```bat
+scripts\windows\start-chat-ui.bat -Model C:\models\qwen3_8_27b_gguf.ninfer
+```
+
+The Windows default is text-only (`NINFER_ENABLE_MEDIA=OFF`); image and video requests are rejected
+before their input is read. The launcher uses the measured 16 GB defaults: MTP3, INT8 KV, a 16K
+context, and 512-token prefill chunks.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:

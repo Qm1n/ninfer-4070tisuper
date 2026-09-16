@@ -38,8 +38,15 @@ foreach ($path in @($Frontend, $Gguf, $Mmproj)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "missing input: $path" }
 }
 
-$code = "import sys; sys.path.insert(0, r'$repo'); from tools.convert.qwen3_8_27b.convert_gguf import main; main()"
-
 Write-Host "converting with $Python (device=$Device)"
-& $Python -u -c $code --frontend $Frontend --gguf $Gguf --mmproj $Mmproj --out $Out --device $Device
-exit $LASTEXITCODE
+$exitCode = 1
+Push-Location $repo
+try {
+    & $Python -u -m tools.convert.qwen3_8_27b.convert_gguf --frontend $Frontend --gguf $Gguf `
+        --mmproj $Mmproj --out $Out --device $Device
+    $exitCode = $LASTEXITCODE
+}
+finally {
+    Pop-Location
+}
+exit $exitCode

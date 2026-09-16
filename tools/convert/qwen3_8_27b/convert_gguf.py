@@ -152,7 +152,7 @@ def convert(
     mmproj_path: str | Path,
     out_path: str | Path,
     *,
-    device: str | torch.device = "cuda",
+    device: str | torch.device = "cpu",
 ) -> Path:
     started = time.perf_counter()
     output = Path(out_path)
@@ -232,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--gguf", required=True, type=Path)
     parser.add_argument("--mmproj", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
     convert(args.frontend, args.gguf, args.mmproj, args.out, device=args.device)
 

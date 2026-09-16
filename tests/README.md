@@ -24,6 +24,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
+- `targets/qwen3_8_27b/` — registered NVFP4 allocation/encoding and GGUF container-transform
+  behavior, including linear-attention head order and Vision patch reconstruction;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
@@ -99,6 +101,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/targets/qwen3_8_27b \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
